@@ -25,7 +25,7 @@ from ..base.web import (
 )
 from ..config.enums import DownloadableFile, FixedScrapingType, HDPicSource, KeepableFile
 from ..config.manager import manager
-from ..config.resource_policy import resource_policy
+from ..config.resource_policy import is_trailer_output_used, resource_policy
 from ..manual import ManualConfig
 from ..models.flags import Flags
 from ..models.log_buffer import LogBuffer
@@ -498,7 +498,8 @@ async def trailer_download(
     download_files = manager.config.download_files
     keep_files = manager.config.keep_files
     trailer_name = manager.config.trailer_simple_name
-    result.trailer = await get_dmm_trailer(result.trailer)  # todo 或许找一个更合适的地方进行统一后处理
+    if is_trailer_output_used():
+        result.trailer = await get_dmm_trailer(result.trailer)  # todo 或许找一个更合适的地方进行统一后处理
     trailer_url = result.trailer
     trailer_old_folder_path = folder_old / "trailers"
     trailer_new_folder_path = folder_new / "trailers"

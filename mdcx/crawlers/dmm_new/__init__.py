@@ -15,6 +15,7 @@ from mdcx.base.web import check_url, get_url_content_length, normalize_media_url
 from mdcx.config.enums import DownloadableFile
 from mdcx.config.manager import manager
 from mdcx.config.models import Website
+from mdcx.config.resource_policy import is_poster_output_used, is_thumb_output_used, is_trailer_output_used
 from mdcx.models.crawl_status import CrawlStatus, record_parse_error, record_request_error, record_status
 from mdcx.models.types import CrawlerInput
 from mdcx.signals import signal
@@ -284,11 +285,14 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
     ) -> CrawlerData:
         label = f"{category.value}:{detail_url}"
         original_thumb = str(item.thumb or "") if is_valid(item.thumb) else ""
-        item.thumb = await self._pick_first_valid_image(
-            ctx,
-            [*self._build_aws_thumb_candidates(ctx, original_thumb), original_thumb],
-            label=f"{label} thumb",
-        )
+        if is_thumb_output_used():
+            item.thumb = await self._pick_first_valid_image(
+                ctx,
+                [*self._build_aws_thumb_candidates(ctx, original_thumb), original_thumb],
+                label=f"{label} thumb",
+            )
+        else:
+            item.thumb = self._with_https(normalize_media_url(original_thumb))
         return item
 
     async def _finalize_result_images(
@@ -304,7 +308,7 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
             if is_valid(getattr(item, "thumb", None))
             else ""
         )
-        if validate_thumb:
+        if validate_thumb and is_thumb_output_used():
             item.thumb = await self._pick_first_valid_image(
                 ctx,
                 [*self._build_aws_thumb_candidates(ctx, original_thumb), original_thumb],
@@ -318,13 +322,17 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
             if is_valid(getattr(item, "poster", None))
             else ""
         )
-        item.poster = await self._pick_first_valid_image(
-            ctx,
-            self._build_poster_candidates(
-                str(getattr(item, "thumb", "") or "") if is_valid(getattr(item, "thumb", None)) else "", original_poster
-            ),
-            label=f"{label} poster",
+        poster_candidates = self._build_poster_candidates(
+            str(getattr(item, "thumb", "") or "") if is_valid(getattr(item, "thumb", None)) else "", original_poster
         )
+        if is_poster_output_used():
+            item.poster = await self._pick_first_valid_image(
+                ctx,
+                poster_candidates,
+                label=f"{label} poster",
+            )
+        else:
+            item.poster = self._with_https(normalize_media_url(poster_candidates[0])) if poster_candidates else ""
 
         if is_valid(getattr(item, "extrafanart", None)):
             extrafanart = list(getattr(item, "extrafanart", []) or [])
@@ -902,6 +910,8 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
         return trailers
 
     async def _fetch_litevideo_trailer_candidates(self, ctx: Context, content_cid: str) -> list[str]:
+        if not is_trailer_output_used():
+            return []
         detail_url = f"https://www.dmm.co.jp/litevideo/-/detail/=/cid={content_cid}/"
         detail_html, error = await self._http_request_with_retry("GET", detail_url)
         if detail_html is None:
@@ -1059,30 +1069,33 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
         if trailer:
             self._log(f"预告片[详情源直取]: cid={content_cid} rank={self._trailer_quality_rank(trailer)} {trailer}")
 
-        should_try_litevideo = not trailer or self._trailer_quality_rank(trailer) < self._trailer_quality_rank(
-            "xhhb.mp4"
-        )
-        if should_try_litevideo:
-            litevideo_candidates = await self._fetch_litevideo_trailer_candidates(ctx, content_cid)
-            if litevideo_candidates:
-                ctx.debug(f"litevideo 直连预告片候选数: {len(litevideo_candidates)} {content_cid=}")
-                self._log(f"预告片[litevideo候选]: cid={content_cid} count={len(litevideo_candidates)}")
-                best_litevideo = self._pick_best_unvalidated_trailer("", litevideo_candidates)
-                if best_litevideo:
-                    self._log(
-                        f"预告片[litevideo最优]: cid={content_cid} rank={self._trailer_quality_rank(best_litevideo)} {best_litevideo}"
-                    )
-                trailer = self._pick_higher_quality_trailer(trailer, best_litevideo)
-
-        if not trailer:
-            fallback_candidates = self._build_fanza_fallback_candidates(
-                sample_movie_thumbnail=sample_movie_thumbnail,
-                fallback_cid=content_cid,
+        if is_trailer_output_used():
+            should_try_litevideo = not trailer or self._trailer_quality_rank(trailer) < self._trailer_quality_rank(
+                "xhhb.mp4"
             )
-            self._log(f"预告片[兜底校验]: cid={content_cid} count={len(fallback_candidates)}")
-            trailer = await self._pick_best_valid_trailer(ctx, fallback_candidates)
-            if trailer:
-                self._log(f"预告片[兜底命中]: cid={content_cid} rank={self._trailer_quality_rank(trailer)} {trailer}")
+            if should_try_litevideo:
+                litevideo_candidates = await self._fetch_litevideo_trailer_candidates(ctx, content_cid)
+                if litevideo_candidates:
+                    ctx.debug(f"litevideo 直连预告片候选数: {len(litevideo_candidates)} {content_cid=}")
+                    self._log(f"预告片[litevideo候选]: cid={content_cid} count={len(litevideo_candidates)}")
+                    best_litevideo = self._pick_best_unvalidated_trailer("", litevideo_candidates)
+                    if best_litevideo:
+                        self._log(
+                            f"预告片[litevideo最优]: cid={content_cid} rank={self._trailer_quality_rank(best_litevideo)} {best_litevideo}"
+                        )
+                    trailer = self._pick_higher_quality_trailer(trailer, best_litevideo)
+
+            if not trailer:
+                fallback_candidates = self._build_fanza_fallback_candidates(
+                    sample_movie_thumbnail=sample_movie_thumbnail,
+                    fallback_cid=content_cid,
+                )
+                self._log(f"预告片[兜底校验]: cid={content_cid} count={len(fallback_candidates)}")
+                trailer = await self._pick_best_valid_trailer(ctx, fallback_candidates)
+                if trailer:
+                    self._log(
+                        f"预告片[兜底命中]: cid={content_cid} rank={self._trailer_quality_rank(trailer)} {trailer}"
+                    )
 
         if trailer:
             self._log(f"预告片[最终]: cid={content_cid} rank={self._trailer_quality_rank(trailer)} {trailer}")
@@ -1298,6 +1311,8 @@ class DmmCrawler(GenericBaseCrawler[DMMContext]):
         trailer_url = self._extract_mono_trailer_from_ga_event(detail_html)
         if trailer_url:
             return trailer_url
+        if not is_trailer_output_used():
+            return ""
 
         ajax_movie_path = self._extract_mono_ajax_movie_path(detail_html)
         if not ajax_movie_path:

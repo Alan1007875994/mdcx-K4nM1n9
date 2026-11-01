@@ -9,6 +9,7 @@ from mdcx.models.crawl_status import record_parse_error
 
 from ..config.enums import FieldRule, Website
 from ..config.manager import manager
+from ..config.resource_policy import is_trailer_output_used
 from ..signals import signal
 from .base import BaseCrawler, Context, CralwerException, CrawlerData
 from .base.types import CrawlerNotFound, CrawlerRequestError
@@ -296,6 +297,8 @@ def getTrailerVideoId(html, number):  # 获取 FC2 视频 ID
 
 
 async def getTrailer(client, html, number):  # 获取预告片
+    if not is_trailer_output_used():
+        return ""
     fc2_video_id = getTrailerVideoId(html, number)
     # FC2 sample 接口返回的是带 mid 参数的临时直链，适合立即下载，不适合长期固化。
     # 注意 path 上的 mid 参数不能丢，否则直链会返回 403。

@@ -18,6 +18,7 @@ from PIL import Image
 from ping3 import ping
 
 from ..config.manager import manager
+from ..config.resource_policy import is_trailer_output_used
 from ..consts import GITHUB_RELEASES_API_LATEST
 from ..models.log_buffer import LogBuffer
 from ..network_fingerprint import build_amazon_headers
@@ -591,6 +592,9 @@ async def get_dmm_trailer(trailer_url: str) -> str:
     # 将相对URL转换为绝对URL
     if trailer_url.startswith("//"):
         trailer_url = "https:" + trailer_url
+
+    if not is_trailer_output_used():
+        return trailer_url
 
     # 处理临时链接格式（/pv/{temp_key}/{filename}），转换为标准格式
     # 临时链接示例: https://cc3001.dmm.co.jp/pv/{temp_key}/asfb00192_mhb_w.mp4

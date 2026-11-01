@@ -8,6 +8,7 @@ from parsel import Selector
 from mdcx.models.crawl_status import record_parse_error
 
 from ..config.models import Website
+from ..config.resource_policy import is_trailer_output_used
 from .base import BaseCrawler, Context, CralwerException, CrawlerData
 
 
@@ -107,6 +108,8 @@ def getExtraFanart(html):
 
 
 async def get_trailer(client, html):
+    if not is_trailer_output_used():
+        return ""
     trailer = ""
     play_url = html.xpath("//a[@class='review-btn']/@href")
     if play_url:

@@ -12,6 +12,7 @@ from mdcx.base.web import check_url, get_url_content_length, is_dmm_image_url, n
 from ..config.enums import DownloadableFile
 from ..config.manager import manager
 from ..config.models import Website
+from ..config.resource_policy import is_poster_output_used, is_thumb_output_used
 from ..signals import signal
 from .base import BaseCrawler, CralwerException, CrawlerData
 
@@ -329,6 +330,8 @@ class AvbaseCrawler(BaseCrawler):
         normalized = normalize_media_url(image_url)
         if not normalized:
             return ""
+        if not is_thumb_output_used():
+            return normalized
         if "pics.dmm.co.jp" in normalized:
             aws_url = normalized.replace("pics.dmm.co.jp", "awsimgsrc.dmm.co.jp/pics_dig").replace("/adult/", "/")
             if validated_aws := await self._check_image_url(ctx, aws_url):
@@ -357,6 +360,8 @@ class AvbaseCrawler(BaseCrawler):
                 )
             )
         )
+        if not is_poster_output_used():
+            return candidates[0] if candidates else ""
         for candidate in candidates:
             if is_dmm_image_url(candidate):
                 if validated := await self._check_image_url(ctx, candidate):
