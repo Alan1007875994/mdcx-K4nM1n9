@@ -3,7 +3,7 @@ import json
 import random
 import re
 from typing import Any, override
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 from parsel import Selector
 
@@ -49,13 +49,20 @@ class AvbaseCrawler(BaseCrawler):
             ctx.debug(f"通过固定 XPath 命中首个结果 ID: {first_result_id}")
             return [detail_url]
 
-        href = html.xpath(
-            '(//a[starts-with(@href, "/works/") and not(starts-with(@href, "/works/date"))])[1]/@href'
-        ).get(default="")
-        if href:
-            detail_url = urljoin(self.base_url, href)
-            ctx.debug(f"固定 XPath 未命中，回退到首个作品链接: {detail_url}")
-            return [detail_url]
+        target_number = (ctx.input.number or "").replace("-", "").strip().lower()
+        if target_number:
+            for href in html.xpath("//a/@href").getall():
+                href = (href or "").strip()
+                if not href:
+                    continue
+                path = urlsplit(href).path
+                parts = [p for p in path.split("/") if p]
+                if len(parts) == 2 and parts[0] == "works":
+                    work_id = parts[1]
+                    if ":" in work_id and target_number in work_id.replace("-", "").lower():
+                        detail_url = f"{self.base_url}/works/{work_id}"
+                        ctx.debug(f"固定 XPath 未命中，回退到首个作品链接: {detail_url}")
+                        return [detail_url]
 
         return None
 

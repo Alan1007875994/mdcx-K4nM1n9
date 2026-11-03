@@ -1,6 +1,8 @@
 import html as html_utils
 import json
 import re
+import sys
+from collections.abc import Callable
 from enum import StrEnum
 from typing import override
 
@@ -8,8 +10,10 @@ from parsel import Selector
 from pydantic import BaseModel
 
 from mdcx.models.crawl_status import record_parse_error
+from mdcx.signals import signal
+from mdcx.web_async import AsyncWebClient
 
-from ..base import Context, CrawlerData, DetailPageParser, FieldRes, c, extract_all_texts, extract_text
+from ..base import Context, CrawlerData, DetailPageParser, FieldRes, c, extract_all_texts, extract_text, is_valid
 
 
 class Category(StrEnum):
@@ -102,15 +106,69 @@ def parse_media_variant(html: Selector) -> MediaVariant:
     return MediaVariant.UNKNOWN
 
 
+def log_dmm_monthly_title_diagnostic(
+    url: str,
+    html: Selector,
+    *,
+    log_fn: Callable[[str], None] | None = None,
+) -> None:
+    try:
+        diag_url = AsyncWebClient._diagnostic_url(url)
+        page_title = re.sub(r"\s+", " ", "".join(html.xpath("//title//text()").getall())).strip()
+        h1_nodes = html.xpath("//h1")[:5]
+        h1_texts = [re.sub(r"\s+", " ", "".join(node.xpath(".//text()").getall())).strip()[:80] for node in h1_nodes]
+        body_texts = html.xpath("//body//text()[not(ancestor::script or ancestor::style)]").getall()
+        if not body_texts:
+            body_texts = html.xpath("//text()[not(ancestor::script or ancestor::style)]").getall()
+        body_preview = re.sub(r"\s+", "", "".join(body_texts))[:300]
+
+        message = f"🧾 [DMM响应诊断] 阶段=详情 请求={diag_url} title={page_title} h1={h1_texts} body={body_preview}"
+        if log_fn is not None:
+            log_fn(message)
+            return
+
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        signal.add_log(safe_message)
+    except Exception:
+        pass
+
+
 class MonoParser(DetailPageParser):
     """
     适用类别: prime, monthly, mono
     """
 
     @override
+    async def parse(self, ctx, html: Selector, **kwargs) -> CrawlerData:
+        data = await super().parse(ctx, html, **kwargs)
+        url = str(kwargs.get("external_id") or "")
+        if parse_category(url) == Category.MONTHLY and not is_valid(data.title):
+            log_dmm_monthly_title_diagnostic(url, html)
+        return data
+
+    @override
     async def title(self, ctx, html) -> str:
+        # ① 原有两条 XPath
         title = extract_text(html, '//h1[@id="title"]/text()', '//h1[@class="item fn bold"]/text()')
-        return title
+        if title:
+            return title
+
+        # ② 页面第一个 h1 的全部文本（含子节点文本，去首尾空白）
+        h1_nodes = html.xpath("//h1")
+        if h1_nodes:
+            h1_text = "".join(h1_nodes[0].xpath(".//text()").getall()).strip()
+            if h1_text:
+                return h1_text
+
+        # ③ 页面 <title> 文本，去掉末尾从「 - 見放題ch」开始的整段后缀，去首尾空白
+        page_title = "".join(html.xpath("//title//text()").getall()).strip()
+        if page_title:
+            cleaned_title = re.sub(r"\s*[-－]?\s*見放題ch.*$", "", page_title, flags=re.DOTALL).strip()
+            if cleaned_title:
+                return cleaned_title
+
+        return ""
 
     @override
     async def release(self, ctx, html) -> FieldRes[str]:

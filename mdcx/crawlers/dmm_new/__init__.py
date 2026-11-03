@@ -38,6 +38,7 @@ from .parsers import (
     MediaVariant,
     MonoParser,
     RentalParser,
+    log_dmm_monthly_title_diagnostic,
     parse_category,
     parse_media_variant,
 )

@@ -12,7 +12,7 @@ from mdcx.config.models import Config
 from mdcx.controllers.main_window import main_window as module
 from mdcx.controllers.main_window.main_window import MyMAinWindow
 from mdcx.crawlers.base.types import CrawlerData
-from mdcx.crawlers.dmm_new import DMMContext, DmmCrawler
+from mdcx.crawlers.dmm_new import DMMContext, DmmCrawler, MonoParser, log_dmm_monthly_title_diagnostic
 from mdcx.models.flags import Flags
 from mdcx.models.types import CrawlerInput
 from mdcx.signals import signal_qt
@@ -266,6 +266,266 @@ def test_dmm_html_diagnostic_requires_final_url_evidence_and_hides_service_addre
     assert "最终URL=未记录 HTTP状态=200 响应字节数=7 来源=html" in saved
     assert "最终URL=https://www.dmm.co.jp/service/foreign/" in saved
     assert "private-bypass" not in saved
+
+
+@pytest.mark.asyncio
+async def test_dmm_monthly_empty_title_logs_diagnostic_in_request_log(window):
+    win, _, root = window
+    parser = MonoParser()
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    # 当 h1 为空且 <title> 去后缀后为空时，详情页无法取得有效标题，触发诊断日志
+    html_text = """
+    <html>
+    <head>
+        <title> - 見放題ch デラックス - FANZA月額動画</title>
+        <style>body { color: red; }</style>
+    </head>
+    <body>
+        <script>console.log("secret script code");</script>
+        <h1>   </h1>
+        <div>
+            <p>Body visible line 1</p>
+            <span>Body visible line 2</span>
+        </div>
+    </body>
+    </html>
+    """
+    selector = Selector(text=html_text)
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/?token=secret_key"
+    data = await parser.parse(ctx, selector, external_id=monthly_url)
+    assert not data.title
+
+    win.show_detail_log()
+    saved = next((root / "Log").glob("*-请求.txt")).read_text(encoding="utf-8")
+    assert "🧾 [DMM响应诊断] 阶段=详情" in saved
+    assert "请求=https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/" in saved
+    assert "secret_key" not in saved
+    assert "secret script code" not in saved
+    assert "Bodyvisibleline1Bodyvisibleline2" in saved
+
+
+def test_dmm_monthly_title_diagnostic_formatting(window):
+    win, _, root = window
+    long_h1 = "Heading 1 " + "X" * 100
+    html_text = f"""
+    <html>
+    <head>
+        <title>Monthly Error Page</title>
+        <style>body {{ color: red; }}</style>
+    </head>
+    <body>
+        <script>console.log("secret script code");</script>
+        <h1>{long_h1}</h1>
+        <h1>Heading 2</h1>
+        <h1>Heading 3</h1>
+        <h1>Heading 4</h1>
+        <h1>Heading 5</h1>
+        <h1>Heading 6 ignored</h1>
+        <div>
+            <p>Body visible line 1</p>
+            <span>Body visible line 2</span>
+        </div>
+    </body>
+    </html>
+    """
+    selector = Selector(text=html_text)
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/?token=secret_key"
+    log_dmm_monthly_title_diagnostic(monthly_url, selector)
+
+    win.show_detail_log()
+    saved = next((root / "Log").glob("*-请求.txt")).read_text(encoding="utf-8")
+    assert "🧾 [DMM响应诊断] 阶段=详情" in saved
+    assert "请求=https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/" in saved
+    assert "secret_key" not in saved
+    assert "title=Monthly Error Page" in saved
+    assert f"Heading 1 {'X' * 70}" in saved  # Truncated to 80 chars total
+    assert "Heading 6" not in saved.split("h1=")[1].split(" body=")[0]  # Only top 5 h1
+    assert "secret script code" not in saved
+    assert "Bodyvisibleline1Bodyvisibleline2" in saved
+
+
+@pytest.mark.asyncio
+async def test_dmm_monthly_with_valid_title_does_not_log_diagnostic(window):
+    win, _, root = window
+    parser = MonoParser()
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    html_text = """
+    <html>
+    <head><title>Monthly Normal Page</title></head>
+    <body>
+        <h1 id="title">有效标题 作品名</h1>
+        <div><p>Normal body</p></div>
+    </body>
+    </html>
+    """
+    selector = Selector(text=html_text)
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/"
+    data = await parser.parse(ctx, selector, external_id=monthly_url)
+    assert data.title == "有效标题 作品名"
+
+    win.show_detail_log()
+    saved_files = list((root / "Log").glob("*-请求.txt"))
+    if saved_files:
+        saved = saved_files[0].read_text(encoding="utf-8")
+        assert "🧾 [DMM响应诊断]" not in saved
+
+
+@pytest.mark.asyncio
+async def test_dmm_monthly_title_plain_h1_without_attributes_and_no_diagnostic(window):
+    win, _, root = window
+    parser = MonoParser()
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    html_text = """
+    <html>
+    <head><title>虚构月额作品标题 - 見放題ch デラックス - FANZA月額動画</title></head>
+    <body>
+        <h1>虚构月额作品标题无属性 <span>特别篇</span></h1>
+        <div><p>Normal body</p></div>
+    </body>
+    </html>
+    """
+    selector = Selector(text=html_text)
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/"
+    data = await parser.parse(ctx, selector, external_id=monthly_url)
+    assert data.title == "虚构月额作品标题无属性 特别篇"
+
+    win.show_detail_log()
+    saved_files = list((root / "Log").glob("*-请求.txt"))
+    if saved_files:
+        saved = saved_files[0].read_text(encoding="utf-8")
+        assert "🧾 [DMM响应诊断]" not in saved
+
+
+@pytest.mark.asyncio
+async def test_dmm_monthly_title_fallback_to_title_tag_with_suffix_removed(window):
+    win, _, root = window
+    parser = MonoParser()
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    # h1 为空（或仅空白），回退到 <title> 并去除末尾「 - 見放題ch」后缀
+    cases = [
+        (
+            """
+            <html>
+            <head><title>虚构月额作品标题甲 - 見放題ch デラックス - FANZA月額動画</title></head>
+            <body><h1></h1></body>
+            </html>
+            """,
+            "虚构月额作品标题甲",
+        ),
+        (
+            """
+            <html>
+            <head><title>虚构月额作品标题乙 - 見放題ch - FANZA月額動画</title></head>
+            <body><div>无 h1 标签</div></body>
+            </html>
+            """,
+            "虚构月额作品标题乙",
+        ),
+        (
+            """
+            <html>
+            <head><title>  虚构月额作品标题丙  - 見放題ch  </title></head>
+            <body><h1>   </h1></body>
+            </html>
+            """,
+            "虚构月额作品标题丙",
+        ),
+        (
+            """
+            <html>
+            <head><title>虚构月额作品标题丁 － 見放題ch デラックス - FANZA月額動画</title></head>
+            <body></body>
+            </html>
+            """,
+            "虚构月额作品标题丁",
+        ),
+    ]
+
+    for html_text, expected_title in cases:
+        selector = Selector(text=html_text)
+        title = await parser.title(ctx, selector)
+        assert title == expected_title
+
+    # 通过 parse 解析时不应产生诊断日志
+    first_html, first_expected = cases[0]
+    selector = Selector(text=first_html)
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/"
+    data = await parser.parse(ctx, selector, external_id=monthly_url)
+    assert data.title == first_expected
+
+    win.show_detail_log()
+    saved_files = list((root / "Log").glob("*-请求.txt"))
+    if saved_files:
+        saved = saved_files[0].read_text(encoding="utf-8")
+        assert "🧾 [DMM响应诊断]" not in saved
+
+
+@pytest.mark.asyncio
+async def test_dmm_monthly_title_original_xpaths_precedence():
+    parser = MonoParser()
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    # 原有两条 XPath 命中时行为不变，优先级高于普通 h1 和 <title>
+    html_id_title = """
+    <html>
+    <head><title>Title备用标题 - 見放題ch デラックス - FANZA月額動画</title></head>
+    <body>
+        <h1 id="title">虚构原有XPath标题一</h1>
+        <h1>普通H1备用标题</h1>
+    </body>
+    </html>
+    """
+    assert await parser.title(ctx, Selector(text=html_id_title)) == "虚构原有XPath标题一"
+
+    html_class_title = """
+    <html>
+    <head><title>Title备用标题 - 見放題ch - FANZA月額動画</title></head>
+    <body>
+        <h1 class="item fn bold">虚构原有XPath标题二</h1>
+        <h1>普通H1备用标题</h1>
+    </body>
+    </html>
+    """
+    assert await parser.title(ctx, Selector(text=html_class_title)) == "虚构原有XPath标题二"
+
+
+@pytest.mark.asyncio
+async def test_dmm_fetch_and_parse_monthly_empty_title_logs_diagnostic(window):
+    win, _, root = window
+    crawler = DmmCrawler(client=None)
+    ctx = DMMContext(input=CrawlerInput.empty())
+    ctx.input.number = "FAKE-001"
+
+    html_text = """
+    <html>
+    <head><title> - 見放題ch - FANZA月額動画</title></head>
+    <body>
+        <p>No valid movie title here</p>
+    </body>
+    </html>
+    """
+
+    async def fake_fetch_detail(ctx, url, use_browser=None):
+        return html_text, ""
+
+    crawler._fetch_detail = fake_fetch_detail
+    monthly_url = "https://www.dmm.co.jp/monthly/premium/-/detail/=/cid=fake00123/"
+    data = await crawler.fetch_and_parse(ctx, monthly_url, crawler.mono)
+    assert not data.title
+
+    win.show_detail_log()
+    saved = next((root / "Log").glob("*-请求.txt")).read_text(encoding="utf-8")
+    assert "🧾 [DMM响应诊断] 阶段=详情" in saved
+    assert "title=- 見放題ch - FANZA月額動画" in saved
 
 
 def test_taskbar_counts_first_pass_including_deferred_and_clears_on_end(window, monkeypatch):
