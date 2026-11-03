@@ -23,6 +23,7 @@ class Scenario:
     direct_body: bytes = CHALLENGE
     direct_delay: float = 0
     mirror_status: int = 503
+    mirror_delay: float = 0
     html_status: int = 200
     html_delay: float = 0.05
 
@@ -113,6 +114,7 @@ class FakeBypassServer:
                 if status == 200:
                     self.warmed.add(host)
             elif kind == "mirror":
+                await asyncio.sleep(scenario.mirror_delay)
                 status = 200 if host in self.warmed else scenario.mirror_status
                 body = b"<html>ok</html>"
             else:

@@ -32,6 +32,7 @@ class _NumberBudget:
     remaining: float
     deadline: float = 0
     active: int = 0
+    wall_deadline: float = 0
 
 
 class GenericBaseCrawler[T: Context = Context](ABC):
@@ -103,6 +104,12 @@ class GenericBaseCrawler[T: Context = Context](ABC):
         ban_states = getattr(self.async_client, "_site_ban_states", {})
         state = ban_states.get(self.site().value)
         return bool(state and state.circuit_open)
+
+    def reset_wall_timeout(self, number: str) -> None:
+        """Only the formal batch-end retry starts a new wall-clock round."""
+        budget = self._number_budgets.get(number)
+        if budget is not None:
+            budget.wall_deadline = 0
 
     async def run(self, input: CrawlerInput) -> CrawlerResponse:
         issues = []
@@ -182,8 +189,11 @@ class GenericBaseCrawler[T: Context = Context](ABC):
 
         # Keep lightweight HTTP clients used by parser callers compatible.
         total_timeout = getattr(self.async_client, "site_total_timeout", 120)
+        wall_timeout = getattr(self.async_client, "site_wall_timeout", 180)
         loop = asyncio.get_running_loop()
         budget = self._number_budgets.setdefault(input.number, _NumberBudget(remaining=total_timeout))
+        if not budget.wall_deadline:
+            budget.wall_deadline = loop.time() + wall_timeout
         if budget.active == 0:
             budget.deadline = loop.time() + budget.remaining
         budget.active += 1
@@ -195,14 +205,21 @@ class GenericBaseCrawler[T: Context = Context](ABC):
         )
         token = crawl_request_state.set(state)
         try:
-            async with asyncio.timeout_at(budget.deadline) as timeout_ctx:
-                state.timeout_ctx = timeout_ctx
-                data = await self._run(ctx)
+            if loop.time() >= budget.wall_deadline:
+                raise TimeoutError
+            async with asyncio.timeout_at(budget.wall_deadline):
+                async with asyncio.timeout_at(budget.deadline) as timeout_ctx:
+                    state.timeout_ctx = timeout_ctx
+                    data = await self._run(ctx)
             if data is None and state.request_failed and not state.is_ban_failure:
                 self._open_circuit("允许的请求尝试已耗尽，未取得页面")
             return CrawlerResponse(data=data, debug_info=ctx.debug_info)
         except TimeoutError:
-            reason = f"单站单番号总等待超限 ({total_timeout:g}s)，番号={input.number}"
+            reason = (
+                f"单站单番号墙钟超限 ({wall_timeout:g}s)，番号={input.number}"
+                if loop.time() >= budget.wall_deadline
+                else f"单站单番号总等待超限 ({total_timeout:g}s)，番号={input.number}"
+            )
             ctx.debug(reason)
             ctx.debug_info.error = TimeoutError(reason)
             return CrawlerResponse(debug_info=ctx.debug_info)

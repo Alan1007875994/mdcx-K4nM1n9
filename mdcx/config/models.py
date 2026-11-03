@@ -695,6 +695,7 @@ class Config(BaseModel):
     cf_bypass_proxy: str = Field(default="", title="Cloudflare Bypass代理地址")
     cf_bypass_timeout: int = Field(default=90, gt=0, title="/html 等待时间（秒）")
     site_total_timeout: int = Field(default=120, gt=0, title="单站单番号总等待上限（秒）")
+    site_wall_timeout: int = Field(default=180, gt=0, title="单站墙钟上限（秒）")
     timeout: int = Field(default=10, title="超时")
     retry: int = Field(default=3, title="重试")
     request_interval: float = Field(

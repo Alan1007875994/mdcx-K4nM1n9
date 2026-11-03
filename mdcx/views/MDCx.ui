@@ -20161,14 +20161,14 @@
                       <x>0</x>
                       <y>0</y>
                       <width>760</width>
-                      <height>1500</height>
+                      <height>1560</height>
                     </rect>
                   </property>
                   <widget class="QGroupBox" name="groupBox_10">
                     <property name="geometry">
                       <rect>
                         <x>30</x>
-                        <y>320</y>
+                        <y>450</y>
                         <width>701</width>
                         <height>531</height>
                       </rect>
@@ -20487,7 +20487,7 @@
                         <x>30</x>
                         <y>20</y>
                         <width>701</width>
-                        <height>281</height>
+                        <height>411</height>
                       </rect>
                     </property>
                     <property name="styleSheet">
@@ -20502,7 +20502,7 @@
                           <x>20</x>
                           <y>30</y>
                           <width>661</width>
-                          <height>264</height>
+                          <height>371</height>
                         </rect>
                       </property>
                       <layout class="QGridLayout" name="gridLayout_9">
@@ -21007,6 +21007,21 @@
                             </property>
                           </widget>
                         </item>
+                        <item row="8" column="0">
+                          <widget class="QLabel" name="label_site_wall_timeout">
+                            <property name="text"><string>单站墙钟上限：</string></property>
+                            <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+                          </widget>
+                        </item>
+                        <item row="8" column="1">
+                          <widget class="QSpinBox" name="spinBox_site_wall_timeout">
+                            <property name="minimum"><number>1</number></property>
+                            <property name="maximum"><number>2147483647</number></property>
+                            <property name="value"><number>180</number></property>
+                            <property name="suffix"><string> 秒</string></property>
+                            <property name="toolTip"><string>同站同番号从本轮首次进入起计时，包含排锁、/html 排队、防封暂停、请求间隔和退避；到点放弃此站，不提前请求。仅批末正式重刮重新起算。原 120 秒活动预算另行保留，豁免等待只影响活动预算，不延长墙钟上限。</string></property>
+                          </widget>
+                        </item>
                       </layout>
                     </widget>
                   </widget>
@@ -21014,7 +21029,7 @@
                     <property name="geometry">
                       <rect>
                         <x>30</x>
-                        <y>1070</y>
+                        <y>1200</y>
                         <width>701</width>
                         <height>301</height>
                       </rect>
@@ -21205,7 +21220,7 @@
                     <property name="geometry">
                       <rect>
                         <x>30</x>
-                        <y>870</y>
+                        <y>1000</y>
                         <width>701</width>
                         <height>181</height>
                       </rect>

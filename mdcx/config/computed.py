@@ -35,6 +35,7 @@ class Computed:
             cf_bypass_proxy=config.cf_bypass_proxy,
             cf_bypass_timeout=config.cf_bypass_timeout,
             site_total_timeout=config.site_total_timeout,
+            site_wall_timeout=config.site_wall_timeout,
             request_interval=config.request_interval,
             site_request_intervals=config.get_site_request_intervals(),
             log_fn=signal.add_log,

@@ -257,6 +257,16 @@ class FileScraper:
             return data
         return all_res.get((site, Language.UNDEFINED))
 
+    async def reset_wall_timeouts(self, task_input: CrawlTask, sites: list[str]) -> None:
+        """Reset only failed sites at the formal batch-end retry boundary."""
+        for site_name in set(sites):
+            site = Website(site_name)
+            number = task_input.number
+            if task_input.short_number and site not in {Website.MGSTAGE, Website.AVSEX}:
+                number = task_input.short_number
+            crawler = await self.crawler_provider.get(site)
+            crawler.reset_wall_timeout(number)
+
     async def _call_crawler(
         self, task_input: CrawlerInput, website: Website, timeout: float | None = 30
     ) -> CrawlerResponse:

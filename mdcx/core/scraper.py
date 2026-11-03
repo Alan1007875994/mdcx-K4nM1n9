@@ -822,7 +822,10 @@ class Scraper:
                             self._quality_resolved[movie_number]
                         )
                     else:
-                        retried = bool(await retryable_sites(scraper))
+                        retry_sites = await retryable_sites(scraper)
+                        retried = bool(retry_sites)
+                        if retried:
+                            await scraper.reset_wall_timeouts(crawl_task, retry_sites)
                         res = (
                             await scraper.run(crawl_task, file_mode)
                             if retried

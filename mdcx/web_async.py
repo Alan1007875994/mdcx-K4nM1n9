@@ -49,6 +49,10 @@ class SiteCircuitOpen(Exception):
     status = CrawlStatus.SKIPPED
 
 
+class SiteWallTimeout(TimeoutError):
+    """A round has expired; request retries must not consume this exception."""
+
+
 BAN_RETRY_SLEEP_SECONDS = 15.0
 BAN_SITE_PAUSE_SECONDS = 60.0
 BAN_MAX_CONSECUTIVE_FAILURES = 3
@@ -133,6 +137,9 @@ async def exempt_crawl_timeout():
 
 def _check_site_circuit() -> None:
     state = crawl_request_state.get()
+    budget = getattr(state, "budget", None)
+    if budget is not None and asyncio.get_running_loop().time() >= budget.wall_deadline:
+        raise SiteWallTimeout("单站单番号墙钟超限")
     if state is not None and state.is_blocked():
         raise SiteCircuitOpen("站点已断路，本次运行不再请求")
 
@@ -430,6 +437,7 @@ class AsyncWebClient:
         cf_bypass_proxy: str | None = None,
         cf_bypass_timeout: float = 90,
         site_total_timeout: float = 120,
+        site_wall_timeout: float = 180,
         request_interval: float | None = None,
         site_request_intervals: Mapping[str, float] | None = None,
         log_fn: Callable[[str], None] | None = None,
@@ -439,6 +447,7 @@ class AsyncWebClient:
         self.proxy = proxy
         self.timeout = timeout
         self.site_total_timeout = float(site_total_timeout)
+        self.site_wall_timeout = float(site_wall_timeout)
         self.max_clients = 100
         self._session_kwargs = {
             "max_clients": self.max_clients,
@@ -666,8 +675,13 @@ class AsyncWebClient:
         try:
             await self._wait_for_site_pause_if_needed(site_key)
             _check_site_circuit()
-            coro = session.request(**kwargs)
             timeout_seconds = self._request_timeout_seconds(kwargs.get("timeout"))
+            state = crawl_request_state.get()
+            budget = getattr(state, "budget", None)
+            if budget is not None:
+                remaining = budget.wall_deadline - asyncio.get_running_loop().time()
+                timeout_seconds = min(timeout_seconds, remaining) if timeout_seconds is not None else remaining
+            coro = session.request(**kwargs)
             if timeout_seconds is None:
                 response = await coro
             else:
@@ -678,9 +692,11 @@ class AsyncWebClient:
                     response, pool=pool, generation=generation, request_loop=request_loop
                 )
             return response
-        except SiteCircuitOpen:
+        except (SiteCircuitOpen, SiteWallTimeout):
             raise
         except Exception as exc:
+            # A transport timeout at the hard deadline is not a new site failure.
+            _check_site_circuit()
             # Log metadata only: exception strings can contain credentials or proxy addresses.
             with contextlib.suppress(Exception):
                 host = urlsplit(url).hostname or "未知"
@@ -1424,7 +1440,7 @@ class AsyncWebClient:
                     allow_redirects=False,
                 )
                 error = ""
-            except SiteCircuitOpen:
+            except (SiteCircuitOpen, SiteWallTimeout):
                 raise
             except Timeout:
                 response = None
@@ -1484,7 +1500,7 @@ class AsyncWebClient:
                             stream=False,
                             allow_redirects=False,
                         )
-                    except SiteCircuitOpen:
+                    except (SiteCircuitOpen, SiteWallTimeout):
                         raise
                     except Timeout:
                         response = None
@@ -1587,6 +1603,8 @@ class AsyncWebClient:
                         enable_cf_bypass=False,
                         retry_count=1,
                     )
+            except SiteWallTimeout:
+                raise
             except TimeoutError:
                 response, error = None, f"/html 等待超时 ({self._cf_bypass_timeout:g}s)"
             finally:
@@ -2046,7 +2064,7 @@ class AsyncWebClient:
                         await self._record_transport_success(pool_key=pool_key)
                         await self._record_site_success(site_key)
                         return resp, ""
-                except SiteCircuitOpen:
+                except (SiteCircuitOpen, SiteWallTimeout):
                     raise
                 except Timeout:
                     error_msg = "连接超时"
@@ -2108,7 +2126,7 @@ class AsyncWebClient:
                 await self._record_site_ban_failure(site_key, status_code=None, request_start_time=request_start_time)
             self._record_crawl_failure(error_msg)
             return None, f"{method} {url} 失败: {error_msg}"
-        except SiteCircuitOpen:
+        except (SiteCircuitOpen, SiteWallTimeout):
             raise
         except Exception as e:
             error_msg = f"{method} {url} 未知错误:  {str(e)}"

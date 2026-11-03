@@ -289,3 +289,33 @@ def test_issue_40_acceptance_steps_ui_terms():
         assert text is not None and text.strip() == expected, (name, text, expected)
     for name in ("comboBox_change_config", "lineEdit_config_folder", "lineEdit_movie_path", "textBrowser_log_main_2"):
         assert root.find(f'.//*[@name="{name}"]') is not None
+
+
+def test_site_wall_timeout_ui_terms_and_generated_control():
+    from PyQt6.QtWidgets import QApplication, QMainWindow
+
+    from mdcx.views.MDCx import Ui_MDCx
+
+    root = ET.parse("mdcx/views/MDCx.ui").getroot()
+    texts = [node.text or "" for node in root.iter("string")]
+    for term in ("设置", "网络", "单站墙钟上限"):
+        assert any(term in text for text in texts)
+    app = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    ui = Ui_MDCx()
+    try:
+        ui.setupUi(window)
+        window.show()
+        app.processEvents()
+        control = ui.spinBox_site_wall_timeout
+        assert ui.label_site_wall_timeout.text() == "单站墙钟上限："
+        assert control.value() == 180
+        assert control.minimum() == 1
+        assert "120 秒活动预算" in control.toolTip()
+        assert "不延长墙钟上限" in control.toolTip()
+        assert "仅批末正式重刮重新起算" in control.toolTip()
+        assert control.geometry().height() >= 20
+        grid = control.parentWidget()
+        assert grid.height() >= grid.layout().sizeHint().height()
+    finally:
+        window.close()
