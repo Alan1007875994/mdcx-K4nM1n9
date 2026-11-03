@@ -30,6 +30,7 @@ from ..config.extend import get_movie_path_setting, parse_media_paths
 from ..config.manager import manager
 from ..config.resources import resources
 from ..crawler import CrawlerProvider
+from ..models.crawl_status import BatchDiagnostics, batch_diagnostics
 from ..models.enums import FileMode
 from ..models.flags import FileDoneDict, Flags
 from ..models.log_buffer import LogBuffer
@@ -194,6 +195,13 @@ class Scraper:
             await self.crawler_provider.close()
 
     async def _run(self, file_mode: FileMode, movie_list: list[Path] | None) -> None:
+        token = batch_diagnostics.set(BatchDiagnostics())
+        try:
+            await self._run_batch(file_mode, movie_list)
+        finally:
+            batch_diagnostics.reset(token)
+
+    async def _run_batch(self, file_mode: FileMode, movie_list: list[Path] | None) -> None:
         Flags.reset()
         self._quality_pending.clear()
         self._quality_by_number.clear()
@@ -290,15 +298,21 @@ class Scraper:
             Flags.next_start_time = time.time()
 
             # 异步并发（按并发数渐进投喂任务，避免大列表一次性创建海量协程）
-            await self._run_tasks_with_limit(movie_list, task_count, thread_number)
-            if self._quality_pending and not (signal.stop or Flags.stop_requested):
-                self._check_stop("批末质量复查")
-                self._quality_retrying = True
-                signal.show_log_text(f"🔁 批末质量复查：{len(self._quality_pending)} 部，每部最多重刮一次")
-                await self._run_tasks_with_limit(list(self._quality_pending), task_count, thread_number)
-                self._quality_retrying = False
-            if self._quality_summaries:
-                signal.show_log_text("\n📋 刮削质量摘要\n" + "\n".join(self._quality_summaries))
+            batch_completed = False
+            try:
+                await self._run_tasks_with_limit(movie_list, task_count, thread_number)
+                if self._quality_pending and not (signal.stop or Flags.stop_requested):
+                    self._check_stop("批末质量复查")
+                    self._quality_retrying = True
+                    signal.show_log_text(f"🔁 批末质量复查：{len(self._quality_pending)} 部，每部最多重刮一次")
+                    await self._run_tasks_with_limit(list(self._quality_pending), task_count, thread_number)
+                    self._quality_retrying = False
+                if self._quality_summaries:
+                    signal.show_log_text("\n📋 刮削质量摘要\n" + "\n".join(self._quality_summaries))
+                batch_completed = not (signal.stop or Flags.stop_requested) and Flags.scrape_done >= task_count
+            finally:
+                if (batch := batch_diagnostics.get()) is not None:
+                    signal.show_log_text("\n" + "\n".join(batch.lines(incomplete=not batch_completed)))
             if Flags.scrape_done < task_count and not (signal.stop or Flags.stop_requested):
                 message = f"刮削异常提前结束：已完成 {Flags.scrape_done}/{task_count}，剩余 {task_count - Flags.scrape_done} 个任务未执行"
                 signal.show_traceback_log(message)
@@ -836,6 +850,12 @@ class Scraper:
                         )
             else:
                 res = await scraper.run(crawl_task, file_mode)
+            if (batch := batch_diagnostics.get()) is not None:
+                batch.record_movie(
+                    movie_number or str(file_path),
+                    bool(missing_required(scraper.raw_result, file_classification.scraping_type)),
+                    scraper.reports,
+                )
             has_error = any(report.has_error for report in getattr(scraper, "reports", []))
             if (has_error and bool(movie_number or file_info.appoint_url)) or file_path in self._quality_pending:
                 before, original_reports = self._quality_first.setdefault(

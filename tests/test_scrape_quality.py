@@ -629,3 +629,49 @@ async def test_field_log_normal_absence_is_plain_but_errors_remain_red(monkeypat
     assert all(
         "🔴" not in line for line in result.field_log.splitlines() if "未找到" in line or "所有来源均无数据" in line
     )
+
+
+@pytest.mark.asyncio
+async def test_batch_parse_observation_counts_actual_calls_not_cached_reports(monkeypatch):
+    from mdcx.models.crawl_status import BatchDiagnostics, batch_diagnostics
+
+    config = configure(monkeypatch)
+    source, _ = provider(["parse", "full"], ["full"])
+    scraper = FileScraper(config, source)
+    batch = BatchDiagnostics()
+    token = batch_diagnostics.set(batch)
+    try:
+        await scraper.run(task(), FileMode.Default)
+        await scraper.run(task(), FileMode.Default)
+        assert batch.parse_errors["dmm"] == 1
+        assert batch.parse_errors["javdb"] == 0
+    finally:
+        batch_diagnostics.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary,secondary,expected", [("empty", "empty", 1), ("empty", "full", 0), ("parse", "full", 0)]
+)
+async def test_batch_normal_absence_uses_merged_required_fields(gate_env, monkeypatch, primary, secondary, expected):
+    from mdcx.models.crawl_status import BatchDiagnostics, batch_diagnostics
+
+    module, info = gate_env
+    source, _ = provider([primary], [secondary])
+    scraper = module.Scraper(source)
+    batch = BatchDiagnostics()
+
+    class Accepted(Exception):
+        pass
+
+    def accept(*args):
+        raise Accepted
+
+    monkeypatch.setattr(module, "show_result", accept)
+    token = batch_diagnostics.set(batch)
+    try:
+        with pytest.raises((Accepted, QualityDeferred)):
+            await scraper._process_one_file(info, FileMode.Default)
+        assert len(batch.missing_movies - batch.abnormal_movies) == expected
+    finally:
+        batch_diagnostics.reset(token)

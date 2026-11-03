@@ -27,7 +27,7 @@ from curl_cffi.requests.session import HttpMethod
 from curl_cffi.requests.utils import not_set
 from PIL import Image
 
-from .models.crawl_status import CrawlStatus, observe_http
+from .models.crawl_status import CrawlStatus, batch_diagnostics, observe_http
 from .network_fingerprint import (
     BrowserFingerprint,
     RequestPurpose,
@@ -1627,7 +1627,26 @@ class AsyncWebClient:
         response.headers["x-mdcx-bypass-mode"] = "html"
         return response, ""
 
-    async def _try_bypass_cloudflare(
+    async def _try_bypass_cloudflare(self, **kwargs) -> tuple[Response | None, str]:
+        batch = batch_diagnostics.get()
+        try:
+            result = await self._try_bypass_cloudflare_observed(**kwargs)
+        except asyncio.CancelledError:
+            if batch is not None:
+                state = crawl_request_state.get()
+                budget = getattr(state, "budget", None)
+                wall_expired = budget is not None and asyncio.get_running_loop().time() >= budget.wall_deadline
+                batch.record_bypass(kwargs["host"], "wall_timeout" if wall_expired else "cancelled")
+            raise
+        except (SiteCircuitOpen, SiteWallTimeout) as error:
+            if batch is not None:
+                batch.record_bypass(kwargs["host"], "skipped" if isinstance(error, SiteCircuitOpen) else "wall_timeout")
+            raise
+        if batch is not None:
+            batch.record_bypass(kwargs["host"], "success" if result[0] is not None else "failure")
+        return result
+
+    async def _try_bypass_cloudflare_observed(
         self,
         *,
         host: str,

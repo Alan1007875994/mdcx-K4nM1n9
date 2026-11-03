@@ -10,8 +10,10 @@ from parsel import Selector
 from mdcx.config.models import Website
 from mdcx.models.crawl_status import (
     QUALITY_FIELDS,
+    CrawlIssue,
     CrawlStatus,
     SiteReport,
+    batch_diagnostics,
     observations,
     record_parse_error,
     record_request_error,
@@ -165,7 +167,15 @@ class GenericBaseCrawler[T: Context = Context](ABC):
                     if not response.data or not getattr(response.data, name)
                 },
             )
+            if (batch := batch_diagnostics.get()) is not None:
+                batch.record_report(response.report)
             return response
+        except Exception as error:
+            if (batch := batch_diagnostics.get()) is not None:
+                batch.record_report(
+                    SiteReport(self.site().value, [CrawlIssue(CrawlStatus.PARSE_ERROR, type(error).__name__)])
+                )
+            raise
         finally:
             observations.reset(token)
             request_cache.reset(cache_token)

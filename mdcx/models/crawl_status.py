@@ -2,6 +2,7 @@
 
 import copy
 import re
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -96,3 +97,87 @@ def observe_http(*, cache: bool = False):
         return observed
 
     return decorate
+
+
+# Batch-only observations. Context propagation includes all concurrent crawl tasks.
+LINK_MIN_CALLS = 10
+LINK_MIN_FAILURES = 3
+LINK_FAILURE_RATE = 0.25
+LINK_MIN_SITES = 2
+SITE_MIN_CALLS = 3
+SITE_FAILURE_RATE = 0.5
+OTHER_SITE_MIN_SUCCESSES = 3
+
+
+@dataclass
+class BatchDiagnostics:
+    bypass: dict[str, Counter] = field(default_factory=dict)
+    parse_errors: Counter = field(default_factory=Counter)
+    abnormal_movies: set[str] = field(default_factory=set)
+    missing_movies: set[str] = field(default_factory=set)
+
+    def record_bypass(self, site: str, outcome: str) -> None:
+        self.bypass.setdefault(site, Counter())[outcome] += 1
+
+    def record_report(self, report: SiteReport) -> None:
+        # Generic crawler exceptions and invalid field types already map to PARSE_ERROR.
+        self.parse_errors[report.site] += sum(i.status == CrawlStatus.PARSE_ERROR for i in report.issues)
+
+    def record_movie(self, key: str, missing: bool, reports: list[SiteReport]) -> None:
+        if any(report.has_error for report in reports):
+            self.abnormal_movies.add(key)
+        if missing and reports:
+            self.missing_movies.add(key)
+        else:
+            self.missing_movies.discard(key)
+
+    def lines(self, *, incomplete: bool = False) -> list[str]:
+        lines = []
+        successes = sum(counts["success"] for counts in self.bypass.values())
+        failures = sum(counts["failure"] for counts in self.bypass.values())
+        total = successes + failures
+        failed_sites = sum(counts["failure"] > 0 for counts in self.bypass.values())
+        if (
+            total >= LINK_MIN_CALLS
+            and failures >= LINK_MIN_FAILURES
+            and failures / total >= LINK_FAILURE_RATE
+            and failed_sites >= LINK_MIN_SITES
+        ):
+            lines.append(
+                f"诊断：本批 bypass 验证失败偏多（{failures}/{total} 次，涉及 {failed_sites} 个网站），"
+                "多半是 bypass 容器或它用的节点不稳。建议：先换一个节点重刮出错的几部；"
+                "换了还不行，再重启 bypass 容器后重刮。"
+            )
+        for site, counts in sorted(self.bypass.items()):
+            n = counts["success"] + counts["failure"]
+            if (
+                n >= SITE_MIN_CALLS
+                and counts["failure"] / n >= SITE_FAILURE_RATE
+                and successes - counts["success"] >= OTHER_SITE_MIN_SUCCESSES
+            ):
+                lines.append(
+                    f"诊断：{site} 本批访问多数失败（{counts['failure']}/{n} 次），其他网站正常，"
+                    "可能是当前节点被该站限制，或该站验证没通过。建议：稍后再刮，或换节点重刮这几部对照。"
+                )
+        for site, count in sorted(self.parse_errors.items()):
+            if count:
+                lines.append(
+                    f"诊断：{site} 有 {count} 次页面没有被程序正常识别"
+                    "（可能是网站改版、返回了异常页面，也可能是程序问题），请把这次日志交给指挥排查。"
+                )
+        missing = len(self.missing_movies - self.abnormal_movies)
+        if missing:
+            lines.append(
+                f"诊断：有 {missing} 部片的部分字段沿来源链找完仍没有，而且这几部的请求和解析都没出错，"
+                "多半是网站本来没有，不用反复重刮。"
+            )
+        if not lines:
+            lines.append("诊断：本批未发现 bypass、节点或解析异常。")
+        elif not any(self.parse_errors.values()):
+            lines.append("诊断：本批没有记录到解析异常或程序内部异常，上面的问题出在网络或网站一侧。")
+        if incomplete:
+            lines.insert(0, "本批未跑完，以下只统计已完成部分")
+        return lines
+
+
+batch_diagnostics: ContextVar[BatchDiagnostics | None] = ContextVar("batch_diagnostics", default=None)
