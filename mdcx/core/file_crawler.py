@@ -377,10 +377,11 @@ class FileScraper:
                     site_data = all_res[key]
                 elif key in failed:
                     # 不再请求已失败的网站
-                    reduced.field_log += f"\n    🔴 {site:<15} (已失败, 跳过)"
+                    reduced.field_log += f"\n    ⚪ {site:<15} (已失败, 跳过)"
                     continue
                 else:
                     # 如果网站数据尚未请求，则进行请求
+                    failure_marker = "🔴"
                     try:
                         task_input.language = f_lang
                         task_input.org_language = f_lang
@@ -391,6 +392,7 @@ class FileScraper:
                         web_data = await self._call_crawler(task_input, site)
                         req_info.append(f"{sprint_source(*key)} ({web_data.debug_info.execution_time:.2f}s)")
                         if web_data.data is None:
+                            failure_marker = "🔴" if web_data.report.has_error else "⚪"
                             if e := web_data.debug_info.error:
                                 raise e
                             raise ValueError(f"{site} 返回了空数据")
@@ -405,14 +407,14 @@ class FileScraper:
                         failed.add(key)
                         continue
                     except Exception as e:
-                        reduced.field_log += f"\n    🔴 {site:<15} (失败: {str(e)})"
+                        reduced.field_log += f"\n    {failure_marker} {site:<15} (失败: {str(e)})"
                         failed.add(key)
                         continue
 
                 # 检查字段数据
                 field_value = getattr(site_data, field.value, None)
                 if not field_value:
-                    reduced.field_log += f"\n    🔴 {site:<15} (未找到)"
+                    reduced.field_log += f"\n    ⚪ {site:<15} (未找到)"
                     continue
                 if field == CrawlerResultFields.RUNTIME and self._is_invalid_runtime(field_value):
                     reduced.field_log += f"\n    🟡 {site:<15} (runtime=0, 舍弃)"
@@ -458,7 +460,7 @@ class FileScraper:
                 if not (try_all_images and field in image_fields):
                     break
             else:  # 所有来源都无此字段
-                reduced.field_log += "\n    🔴 所有来源均无数据"
+                reduced.field_log += "\n    ⚪ 所有来源均无数据"
 
         # 所有来源均失败
         if len(all_res) == 0:

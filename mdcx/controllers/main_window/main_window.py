@@ -1079,7 +1079,9 @@ class MyMAinWindow(QMainWindow):
     def set_processbar(self, value):
         self.Ui.progressBar_scrape.setProperty("value", value)
         if IS_WINDOWS:
-            if value and not (Flags.stop_requested or signal_qt.stop):
+            if (value or 0 < Flags.scrape_processed < Flags.total_count) and not (
+                Flags.stop_requested or signal_qt.stop
+            ):
                 self._taskbar_progress_active = True
                 self._update_taskbar_progress()
             else:
@@ -1090,7 +1092,7 @@ class MyMAinWindow(QMainWindow):
             if Flags.stop_requested or signal_qt.stop:
                 self._clear_taskbar_progress()
             else:
-                self._taskbar_progress.update(int(self.winId()), Flags.scrape_done, Flags.total_count)
+                self._taskbar_progress.update(int(self.winId()), Flags.scrape_processed, Flags.total_count)
 
     def _clear_taskbar_progress(self):
         self._taskbar_progress_active = False

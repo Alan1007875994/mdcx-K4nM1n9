@@ -531,3 +531,101 @@ async def test_batch_rest_is_consumed_before_deferred_retry(gate_env, monkeypatc
     assert Flags.succ_count == 1
     assert Flags.fail_count == 0
     assert Flags.remain_list == []
+
+
+@pytest.mark.asyncio
+async def test_display_progress_counts_first_pass_outcomes_without_counting_retry(gate_env, monkeypatch):
+    from unittest.mock import Mock
+
+    from mdcx.config.enums import Switch
+    from mdcx.models.types import CrawlersResult, OtherInfo
+
+    module, info = gate_env
+    progress, labels, logs = Mock(), Mock(), Mock()
+    monkeypatch.setattr(module.signal, "exec_set_processbar", SimpleNamespace(emit=progress))
+    monkeypatch.setattr(module.signal, "set_label_file_path", SimpleNamespace(emit=labels))
+    monkeypatch.setattr(module.signal, "show_log_text", logs)
+    monkeypatch.setattr(module, "get_movie_path_setting", lambda *args: SimpleNamespace(failed_folder=info.folder_path))
+
+    async def get_info(*args):
+        return info
+
+    outcomes = iter(["success", "failed", "deferred", "success"])
+    seen_at_start = []
+
+    async def process(self, *args):
+        seen_at_start.append((Flags.scrape_processed, progress.call_args.args[0]))
+        outcome = next(outcomes)
+        if outcome == "deferred":
+            self._quality_pending[info.file_path] = object()
+            raise QualityDeferred
+        if outcome == "failed":
+            return None, None
+        data = CrawlersResult.empty()
+        data.number = info.number
+        return data, OtherInfo.empty()
+
+    async def stay(_folder, path, _old):
+        return path
+
+    monkeypatch.setattr(module, "get_file_info_v2", get_info)
+    monkeypatch.setattr(module, "move_file_to_failed_folder", stay)
+    monkeypatch.setattr(module.Scraper, "_process_one_file", process)
+    for field, value in {
+        "garbage_enabled": False,
+        "thread_time": 0,
+        "switch_on": [Switch.REST_SCRAPE],
+        "rest_count": 100,
+    }.items():
+        monkeypatch.setattr(module.manager.config, field, value)
+    Flags.total_count = 3
+    Flags.remain_list = [info.file_path] * 3
+    scraper = module.Scraper(object())
+    for index in range(3):
+        await scraper.process_one_file((info.file_path, index + 1, 3))
+    assert Flags.scrape_processed == 3
+    assert Flags.scrape_done == 2
+    scraper._quality_retrying = True
+    await scraper.process_one_file((info.file_path, 1, 3))
+    assert seen_at_start == [(0, 0), (1, 33), (2, 66), (3, 100)]
+    assert [c.args[0] for c in progress.call_args_list] == [0, 33, 33, 66, 66, 100, 100, 100]
+    assert Flags.scrape_processed == Flags.scrape_done == 3
+    assert Flags.succ_count == 2 and Flags.fail_count == 1
+    assert "重刮 1/1" in labels.call_args.args[0]
+    assert any("重刮 0/1" in c.args[0] for c in labels.call_args_list)
+    cumulative = [c.args[0] for c in logs.call_args_list if "已累计刮削" in c.args[0]]
+    assert len(cumulative) == 4
+    assert all("/3，" in line or "/3 · 重刮" in line for line in cumulative)
+    assert Flags.remain_list == []
+    Flags.reset()
+    assert Flags.scrape_processed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["empty", "not_found", "error", "parse"])
+async def test_field_log_normal_absence_is_plain_but_errors_remain_red(monkeypatch, failure):
+    from mdcx.crawlers.base import CrawlerNotFound
+
+    config = configure(monkeypatch)
+    source, _ = provider([failure], ["full"])
+    if failure == "empty":
+
+        async def absent(ctx):
+            return None
+
+        source.crawlers[Website.DMM]._run = absent
+    elif failure == "not_found":
+
+        async def absent(ctx):
+            raise CrawlerNotFound("不在官网番号前缀列表中")
+
+        source.crawlers[Website.DMM]._run = absent
+    result = await FileScraper(config, source).run(task(), FileMode.Default)
+    lines = [line for line in result.field_log.splitlines() if "dmm" in line and "失败:" in line]
+    assert lines
+    assert all(("🔴" if failure in {"error", "parse"} else "⚪") in line for line in lines)
+    skipped = [line for line in result.field_log.splitlines() if "已失败, 跳过" in line]
+    assert skipped and all("⚪" in line and "🔴" not in line for line in skipped)
+    assert all(
+        "🔴" not in line for line in result.field_log.splitlines() if "未找到" in line or "所有来源均无数据" in line
+    )

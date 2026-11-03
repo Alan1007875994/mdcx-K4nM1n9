@@ -46,6 +46,7 @@ class _Flags:
     scrape_starting: int = 0  # 已进入过刮削流程的数量
     scrape_started: int = 0  # 已进入过刮削流程并开始的数量
     scrape_done: int = 0  # 已完成刮削数量
+    scrape_processed: int = 0  # 仅供进度显示：首轮已处理数量（含失败、批末复查）
     succ_count: int = 0  # 成功数量
     fail_count: int = 0  # 失败数量
     # 所有文件最终输出路径的字典（如已存在，则视为重复文件，直接跳过）
@@ -97,6 +98,7 @@ class _Flags:
         self.scrape_starting = 0
         self.scrape_started = 0
         self.scrape_done = 0
+        self.scrape_processed = 0
         self.succ_count = 0
         self.fail_count = 0
         self.file_new_path_dic = {}

@@ -100,3 +100,32 @@ def test_com_vtable_uses_64_bit_counts_and_releases(monkeypatch):
     api.close()
     assert calls == [("init",), ("progress", 2**40, 2**33, 2**34), ("clear", 2**40, 0), ("release",)]
     ole.CoUninitialize.assert_called_once()
+
+
+def test_window_taskbar_uses_first_pass_display_count(monkeypatch):
+    from mdcx.controllers.main_window import main_window as module
+    from mdcx.models.flags import Flags
+
+    monkeypatch.setattr(module, "IS_WINDOWS", True)
+    monkeypatch.setattr(module.signal_qt, "stop", False)
+    monkeypatch.setattr(Flags, "stop_requested", False)
+    monkeypatch.setattr(Flags, "scrape_done", 0)
+    monkeypatch.setattr(Flags, "scrape_processed", 1)
+    monkeypatch.setattr(Flags, "total_count", 200)
+    window = SimpleNamespace(
+        Ui=SimpleNamespace(progressBar_scrape=Mock()),
+        _taskbar_progress_active=False,
+        _taskbar_progress=Mock(),
+        winId=lambda: 123,
+    )
+    window._update_taskbar_progress = lambda: module.MyMAinWindow._update_taskbar_progress(window)
+    window._clear_taskbar_progress = lambda: module.MyMAinWindow._clear_taskbar_progress(window)
+    # Less than one percent still updates Windows with the exact same count.
+    module.MyMAinWindow.set_processbar(window, 0)
+    window.Ui.progressBar_scrape.setProperty.assert_called_once_with("value", 0)
+    window._taskbar_progress.update.assert_called_once_with(123, 1, 200)
+    monkeypatch.setattr(Flags, "scrape_processed", 200)
+    module.MyMAinWindow.set_processbar(window, 100)
+    window._taskbar_progress.update.assert_called_with(123, 200, 200)
+    module.MyMAinWindow.set_processbar(window, 0)
+    window._taskbar_progress.clear.assert_called_once_with(123)

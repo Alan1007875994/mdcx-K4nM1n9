@@ -268,16 +268,21 @@ def test_dmm_html_diagnostic_requires_final_url_evidence_and_hides_service_addre
     assert "private-bypass" not in saved
 
 
-def test_taskbar_counts_completed_success_and_failure_and_clears_on_end(window, monkeypatch):
+def test_taskbar_counts_first_pass_including_deferred_and_clears_on_end(window, monkeypatch):
     win, _, _ = window
     monkeypatch.setattr(module, "IS_WINDOWS", True)
     monkeypatch.setattr(Flags, "stop_requested", False)
     monkeypatch.setattr(Flags, "total_count", 23)
     monkeypatch.setattr(Flags, "scrape_done", 5)
+    monkeypatch.setattr(Flags, "scrape_processed", 7)
     monkeypatch.setattr(Flags, "succ_count", 3)
     monkeypatch.setattr(Flags, "fail_count", 2)
-    win.set_processbar(90)  # Existing UI percentage uses started tasks; taskbar uses completed.
-    win._taskbar_progress.update.assert_called_with(int(win.winId()), 5, 23)
+    win.set_processbar(30)  # Success, failure and deferred first-pass outcomes share one count.
+    assert win.Ui.progressBar_scrape.value() == 30
+    win._taskbar_progress.update.assert_called_with(int(win.winId()), 7, 23)
+    monkeypatch.setattr(Flags, "scrape_processed", 23)
+    win.set_processbar(100)
+    win._taskbar_progress.update.assert_called_with(int(win.winId()), 23, 23)
     win.set_processbar(0)
     win._taskbar_progress.clear.assert_called_with(int(win.winId()))
     assert not win._taskbar_progress_active

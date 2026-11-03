@@ -213,7 +213,8 @@ async def translate_actor(res: CrawlersResult):
                     f"\n 👩🏻 Av-wiki done! Actor's real Japanese name is '{temp_actor}' ({get_used_time(start_time)}s)"
                 )
             else:
-                LogBuffer.log().write(f"\n 🔴 Av-wiki failed! {temp_actor} ({get_used_time(start_time)}s)")
+                marker = "⚪" if temp_actor == "No Result!" else "🔴"
+                LogBuffer.log().write(f"\n {marker} Av-wiki failed! {temp_actor} ({get_used_time(start_time)}s)")
 
     # 如果不映射，返回
     if not manager.config.get_field_config(CrawlerResultFields.ACTORS).translate:

@@ -108,6 +108,18 @@ class Scraper:
         self._quality_resolved: dict[str, tuple] = {}
         self._quality_summaries: list[str] = []
         self._quality_completed_attempts = 0
+        self._retry_display_done = 0
+
+    def _display_count(self, total: int) -> str:
+        count = f"{Flags.scrape_processed}/{total}"
+        if self._quality_retrying:
+            count += f" · 重刮 {self._retry_display_done}/{len(self._quality_pending)}"
+        return count
+
+    def _show_progress(self, total: int, file_path: str = "") -> None:
+        value = Flags.scrape_processed / total * 100 if total else 0
+        signal.exec_set_processbar.emit(int(value))
+        signal.set_label_file_path.emit(f"已处理：{self._display_count(total)} {value:.2f}%\n {file_path}")
 
     async def _run_tasks_with_limit(self, movie_list: list[Path], task_count: int, thread_number: int) -> None:
         task_iter = iter(enumerate(movie_list, 1))
@@ -191,6 +203,7 @@ class Scraper:
         self._quality_resolved.clear()
         self._quality_retrying = False
         self._quality_completed_attempts = 0
+        self._retry_display_done = 0
         if movie_list is None:
             movie_list = []
         Flags.scrape_start_time = time.time()  # 开始刮削时间
@@ -256,6 +269,7 @@ class Scraper:
 
         task_count = len(movie_list)
         Flags.total_count = task_count
+        self._show_progress(task_count)
 
         if task_count:
             Flags.count_claw += 1
@@ -375,6 +389,11 @@ class Scraper:
             Flags.scrape_starting += 1
             Flags.scrape_started += 1
             Flags.scrape_done += 1
+            if self._quality_retrying:
+                self._retry_display_done += 1
+            else:
+                Flags.scrape_processed += 1
+            self._show_progress(count_all)
             return
         Flags.counting_order += 1
         count = Flags.counting_order
@@ -399,7 +418,7 @@ class Scraper:
         thread_time = manager.config.thread_time
         if count == 1 or thread_time == 0 or manager.config.main_mode == 4:
             Flags.next_start_time = time.time()
-            signal.show_log_text(f" 🕷 {get_current_time()} 开始刮削：{Flags.scrape_starting}/{count_all} {show_name}")
+            signal.show_log_text(f" 🕷 {get_current_time()} 开始刮削：{self._display_count(count_all)} {show_name}")
             thread_time = 0
         else:
             Flags.next_start_time += thread_time
@@ -408,7 +427,7 @@ class Scraper:
         remain_time = int(Flags.next_start_time - time.time())
         if remain_time > 0:
             signal.show_log_text(
-                f" ⏱ {get_current_time()}（{remain_time}）秒后开始刮削：{count}/{count_all} {show_name}"
+                f" ⏱ {get_current_time()}（{remain_time}）秒后开始刮削：{self._display_count(count_all)} {show_name}"
             )
             for i in range(remain_time):
                 self._check_stop(show_name)
@@ -417,7 +436,7 @@ class Scraper:
         if not self._quality_retrying:
             Flags.scrape_started += 1
         if count > 1 and thread_time != 0:
-            signal.show_log_text(f" 🕷 {get_current_time()} 开始刮削：{Flags.scrape_started}/{count_all} {show_name}")
+            signal.show_log_text(f" 🕷 {get_current_time()} 开始刮削：{self._display_count(count_all)} {show_name}")
 
         start_time = time.time()
         file_mode = Flags.file_mode
@@ -431,12 +450,7 @@ class Scraper:
         file_show_path = file_info.file_show_path
 
         # 显示刮削信息
-        progress_value = Flags.scrape_started / count_all * 100
-        progress_percentage = f"{progress_value:.2f}%"
-        signal.exec_set_processbar.emit(int(progress_value))
-        signal.set_label_file_path.emit(
-            f"正在刮削： {Flags.scrape_started}/{count_all} {progress_percentage} \n {file_show_path}"
-        )
+        self._show_progress(count_all, str(file_show_path))
         signal.label_result.emit(
             f" 刮削中：{Flags.scrape_started - Flags.succ_count - Flags.fail_count} 成功：{Flags.succ_count} 失败：{Flags.fail_count}"
         )
@@ -543,13 +557,18 @@ class Scraper:
         try:
             if not quality_deferred:
                 Flags.scrape_done += 1
+            if self._quality_retrying:
+                self._retry_display_done += 1
+            else:
+                Flags.scrape_processed += 1
+            self._show_progress(count_all, str(file_show_path))
             count = Flags.scrape_done
-            progress_value = count / count_all * 100
+            progress_value = Flags.scrape_processed / count_all * 100
             progress_percentage = f"{progress_value:.2f}%"
             used_time = get_used_time(start_time)
-            scrape_info_begin = f"{count:d}/{count_all:d} ({progress_percentage}) round({Flags.count_claw}) {split_path(file_path)[1]}    新的刮削线程"
+            scrape_info_begin = f"{self._display_count(count_all)} ({progress_percentage}) round({Flags.count_claw}) {split_path(file_path)[1]}    新的刮削线程"
             scrape_info_begin = "\n\n\n" + "👇" * 50 + "\n" + scrape_info_begin
-            scrape_info_after = f"\n 🕷 {get_current_time()} {count}/{count_all} {split_path(file_path)[1]} 刮削完成！用时 {used_time} 秒！"
+            scrape_info_after = f"\n 🕷 {get_current_time()} {self._display_count(count_all)} {split_path(file_path)[1]} 刮削完成！用时 {used_time} 秒！"
             if manager.config.show_web_log:
                 signal.show_log_text(scrape_info_begin + LogBuffer.log().get() + scrape_info_after)
             else:
@@ -564,7 +583,7 @@ class Scraper:
             if Flags.scrape_started == count_all:
                 signal.show_log_text(f" 🕷 剩余正在刮削的线程：{remain_count}")
             signal.label_result.emit(f" 刮削中：{remain_count} 成功：{Flags.succ_count} 失败：{Flags.fail_count}")
-            signal.show_scrape_info(f"🔎 已刮削 {count}/{count_all}")
+            signal.show_scrape_info(f"🔎 已处理 {self._display_count(count_all)}")
         except Exception as e:
             self._check_stop(show_name)
             signal.show_traceback_log(traceback.format_exc())
@@ -592,7 +611,7 @@ class Scraper:
         # 处理间歇刮削
         try:
             if manager.config.main_mode != 4 and Switch.REST_SCRAPE in manager.config.switch_on:
-                time_note = f" 🏖 已累计刮削 {count}/{count_all}，已连续刮削 {count - Flags.rest_now_begin_count}/{manager.config.rest_count}..."
+                time_note = f" 🏖 已累计刮削 {self._display_count(Flags.total_count)}，已连续刮削 {count - Flags.rest_now_begin_count}/{manager.config.rest_count}..."
                 signal.show_log_text(time_note)
                 if count - Flags.rest_now_begin_count >= manager.config.rest_count:
                     if Flags.scrape_starting > count:
