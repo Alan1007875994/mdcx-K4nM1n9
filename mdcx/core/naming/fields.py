@@ -67,6 +67,20 @@ def _clean_field_value(value: object, escape_path_separator: bool) -> str:
     return text
 
 
+def get_version_suffixes(
+    destroyed: str, leak: str, wuma: str, youma: str, cnword: str, umr_stage: str
+) -> tuple[str, str]:
+    """阶段只参与命名；字幕与分类字段保持原值，沿用后缀排序和显示开关。"""
+    moword = destroyed + leak + wuma + youma
+    if destroyed and umr_stage:
+        stage_suffix = "L" if umr_stage == "L" and cnword else f"-{umr_stage}"
+        if cnword:
+            cnword += stage_suffix
+        else:
+            moword += stage_suffix
+    return moword, cnword
+
+
 def build_naming_context(
     file_info: FileInfo,
     data: CrawlersResult,
@@ -85,7 +99,7 @@ def build_naming_context(
     leak = file_info.leak
     wuma = file_info.wuma
     youma = file_info.youma
-    moword = destroyed + leak + wuma + youma
+    moword, _ = get_version_suffixes(destroyed, leak, wuma, youma, "", file_info.umr_stage)
     cnword = file_info.c_word
     definition = file_info.definition.replace("UHD8", "UHD")
 
@@ -98,9 +112,17 @@ def build_naming_context(
     if show_definition_suffix and definition in {"8K", "UHD", "4K"}:
         definition_suffix = f"-{definition}"
 
+    moword_suffix, cnword_suffix = get_version_suffixes(
+        destroyed if show_moword_suffix else "",
+        leak if show_moword_suffix else "",
+        wuma if show_moword_suffix else "",
+        youma if show_moword_suffix else "",
+        cnword if show_cnword_suffix else "",
+        file_info.umr_stage,
+    )
     suffix_values = {
-        "moword": moword if show_moword_suffix else "",
-        "cnword": cnword if show_cnword_suffix else "",
+        "moword": moword_suffix,
+        "cnword": cnword_suffix,
         "definition": definition_suffix,
     }
     for suffix in manager.config.suffix_sort:

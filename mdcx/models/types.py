@@ -54,6 +54,7 @@ class FileInfo:
 
     definition: str
     codec: str
+    umr_stage: str = ""  # 仅供命名使用，不改变破解分类或字幕状态
 
     @property
     def optional_file_path(self) -> Path | None:

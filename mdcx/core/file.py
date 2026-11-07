@@ -28,9 +28,10 @@ from ..utils.file import (
 from ..utils.path import showFilePath
 from .mosaic import normalize_mosaic
 from .naming import FIELD_DESCRIPTIONS, NameRenderOptions, NamingTarget, render_name
+from .naming.fields import get_version_suffixes
 
 
-def _has_umr_suffix_marker(file_name: str, movie_number: str) -> bool:
+def _has_umr_suffix_marker(file_name: str, movie_number: str, *, subtitled: bool = False) -> bool:
     normalized_name = remove_escape_string(file_name, "-").upper()
     normalized_number = movie_number.upper()
     if normalized_number:
@@ -43,7 +44,31 @@ def _has_umr_suffix_marker(file_name: str, movie_number: str) -> bool:
         "4K",
     )
     compact_definition = "|".join(compact_definition_suffixes)
-    return bool(re.search(rf"(?<![A-Z0-9])U(?:C)?(?=(?:{compact_definition}|[-_.\s\]\)]|$))", normalized_name))
+    marker = "UC" if subtitled else "U(?:C)?"
+    return bool(re.search(rf"(?<![A-Z0-9]){marker}(?=(?:{compact_definition}|[-_.\s\]\)]|$))", normalized_name))
+
+
+def _get_umr_stage(file_name: str, movie_number: str, umr_style: str, cnword_style: str) -> tuple[str, bool, str]:
+    """识别完整阶段标记；仅从分集识别输入中移除它，避免旧 -L 被认作第 12 集。"""
+    bases = "|".join(re.escape(s) for s in (umr_style, "-破解", "-克破") if s)
+    subtitle_styles = "|".join(re.escape(s) for s in (cnword_style, "-C") if s)
+    pattern = re.compile(
+        rf"(?:{bases})(?:(?P<sub>{subtitle_styles})(?P<substage>-LTX|L)|(?P<stage>-LTX|-L))"
+        r"(?=[-_.\s\]\)]|$)",
+        re.IGNORECASE,
+    )
+    if match := pattern.search(file_name):
+        stage = (match.group("substage") or match.group("stage")).upper().lstrip("-")
+        return stage, bool(match.group("sub")), pattern.sub("", file_name)
+
+    suffix_name = file_name.upper()
+    if movie_number:
+        suffix_name = suffix_name.replace(movie_number.upper(), "-")
+    if re.search(r"(?<![A-Z0-9])LTX(?=[-_.\s\]\)]|$)", suffix_name):
+        return "LTX", False, file_name
+    if _has_umr_suffix_marker(file_name, movie_number, subtitled=True):
+        return "LTX", True, file_name
+    return "", False, file_name
 
 
 async def creat_folder(
@@ -359,6 +384,7 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
     wuma = ""
     youma = ""
     mosaic = ""
+    umr_stage = ""
     sub_list = []
     cnword_style = manager.config.cnword_style
     if Flags.file_mode == FileMode.Again and file_path in Flags.new_again_dic:
@@ -403,8 +429,11 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
         temp_n = re.findall(r"\d{3,}([a-zA-Z]+-\d+)", movie_number)
         optional_data["short_number"] = temp_n[0] if temp_n else ""
 
+        umr_style = str(manager.config.umr_style)
+        umr_stage, stage_has_sub, file_name_cd = _get_umr_stage(file_name, movie_number, umr_style, cnword_style)
+
         # 去掉各种乱七八糟的字符
-        file_name_cd = remove_escape_string(file_name, "-").replace(movie_number, "-").replace("--", "-").strip()
+        file_name_cd = remove_escape_string(file_name_cd, "-").replace(movie_number, "-").replace("--", "-").strip()
 
         # 替换分隔符为-
         cd_char = manager.config.cd_char
@@ -484,7 +513,6 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
 
         # 判断是否是马赛克破坏版
         file_path_lower = file_path_str.lower()
-        umr_style = str(manager.config.umr_style)
         umr_style_lower = umr_style.lower()
         if (
             "-uncensored." in file_path_lower
@@ -494,6 +522,7 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
             or "克破" in file_path_str
             or (umr_style_lower and umr_style_lower in file_path_lower)
             or _has_umr_suffix_marker(file_name, movie_number)
+            or umr_stage
         ):
             destroyed = umr_style
             mosaic = "无码破解"
@@ -582,6 +611,9 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
                     has_sub = True
 
         # 判断路径名是否有中文字幕字符
+        if stage_has_sub:
+            c_word = cnword_style
+            has_sub = True
         if not has_sub:
             cnword_list.append("-uc.")
             file_name_temp = file_name_temp.upper().replace("CD", "").replace("CARIB", "")  # 去掉cd/carib，避免-c误判
@@ -666,13 +698,14 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
 
         mosaic = normalize_mosaic(mosaic)
 
+        moword_suffix, cnword_suffix = get_version_suffixes(destroyed, leak, wuma, youma, c_word, umr_stage)
         file_show_name = movie_number
         suffix_sort_list = manager.config.suffix_sort
         for each in suffix_sort_list:
             if each == "moword":
-                file_show_name += destroyed + leak + wuma + youma
+                file_show_name += moword_suffix
             elif each == "cnword":
-                file_show_name += c_word
+                file_show_name += cnword_suffix
         file_show_name += cd_part
 
     except Exception:
@@ -706,6 +739,7 @@ async def get_file_info_v2(file_path: Path, copy_sub: bool = True) -> FileInfo:
         website_name=optional_data.get("website_name", ""),
         definition="",
         codec="",
+        umr_stage=umr_stage,
     )
 
 
