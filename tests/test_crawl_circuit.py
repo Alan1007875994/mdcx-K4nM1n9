@@ -215,6 +215,8 @@ async def test_real_jav321_exhausts_normal_timeout_attempts_then_skips():
         assert any("(5/5)" in line for line in logs)
         await crawler.run(crawl_input("PDVIJ-001"))
         await crawler.run(crawl_input("PRED-110"))
-        assert server.count("direct", "plain.test") == 5
+        assert server.count("direct", "plain.test") == 15
+        await crawler.run(crawl_input("IPX-001"))
+        assert server.count("direct", "plain.test") == 15
         assert sum("跳过后续番号" in line for line in logs) == 1
         await client.close()

@@ -56,6 +56,8 @@ class SiteWallTimeout(TimeoutError):
 BAN_RETRY_SLEEP_SECONDS = 15.0
 BAN_SITE_PAUSE_SECONDS = 60.0
 BAN_MAX_CONSECUTIVE_FAILURES = 3
+# request() 里网络类异常 (非 HTTP 状态码) 的错误信息前缀, 用于区分「网络类失败」与「HTTP 状态耗尽」
+_NETWORK_ERROR_PREFIXES = ("连接超时", "连接错误", "请求异常", "请求等待超时", "curl-cffi 异常")
 
 
 @dataclass
@@ -78,6 +80,8 @@ class CrawlRequestState:
     is_ban_failure: bool = False
     ban_failure_recorded: bool = False
     abandoned_error: str = ""
+    # 最近一次请求失败是网络类异常 (连接/TLS/超时/HTTP2 等), 而非 HTTP 状态码
+    network_failure: bool = False
 
 
 crawl_request_state: ContextVar[CrawlRequestState | None] = ContextVar("crawl_request_state", default=None)
@@ -1297,7 +1301,7 @@ class AsyncWebClient:
                 self._log(f"✅ [封禁] {site_key} 恢复正常，失败计数清零")
 
     async def _record_site_ban_failure(
-        self, site_key: str, *, status_code: int | None, request_start_time: float
+        self, site_key: str, *, status_code: int | None, request_start_time: float, network: bool = False
     ) -> None:
         async with self._site_ban_lock:
             state = self._site_ban_states.setdefault(site_key, _SiteBanState())
@@ -1321,7 +1325,7 @@ class AsyncWebClient:
             state.last_failure_trigger_time = now
             state.pause_until = now + BAN_SITE_PAUSE_SECONDS
 
-            failure = "被拒" if status_code is not None else "CF/bypass 失败"
+            failure = "被拒" if status_code is not None else ("网络错误" if network else "CF/bypass 失败")
             self._log(
                 f"⏸️ [封禁] {site_key} 第 {state.failure_count}/{int(BAN_MAX_CONSECUTIVE_FAILURES)} 次{failure}，暂停该站 {int(BAN_SITE_PAUSE_SECONDS)}s"
             )
@@ -1332,6 +1336,8 @@ class AsyncWebClient:
                 reason = f"连续 {int(BAN_MAX_CONSECUTIVE_FAILURES)} 部片被拒绝 ({status_code})，可能已被限制访问"
                 if status_code is None:
                     reason = f"连续 {int(BAN_MAX_CONSECUTIVE_FAILURES)} 部片请求失败（CF/bypass 或访问受限）"
+                    if network:
+                        reason = f"连续 {int(BAN_MAX_CONSECUTIVE_FAILURES)} 部片网络请求失败（连接、超时或重试耗尽）"
                 if req_state and req_state.open_circuit:
                     req_state.open_circuit(reason)
                 else:
@@ -2158,6 +2164,7 @@ class AsyncWebClient:
         # A missing number is a normal result, including mirror's terminal 404.
         if state is not None and not getattr(state, "is_ban_failure", False) and not re.search(r"\bHTTP 404\b", error):
             state.request_failed = True
+            state.network_failure = error.startswith(_NETWORK_ERROR_PREFIXES)
 
     @observe_http(cache=True)
     async def get_text(

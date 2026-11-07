@@ -187,6 +187,7 @@ class GenericBaseCrawler[T: Context = Context](ABC):
         此方法负责初始化 `Context`, 处理异常, 记录调试信息等. 具体执行流程应在 `_run` 方法中实现.
         """
         start_time = time.time()
+        request_start_time = self._client_time()
         ctx = self.new_context(input)
         ctx.debug(f"{input=}")
 
@@ -222,7 +223,7 @@ class GenericBaseCrawler[T: Context = Context](ABC):
                     state.timeout_ctx = timeout_ctx
                     data = await self._run(ctx)
             if data is None and state.request_failed and not state.is_ban_failure:
-                self._open_circuit("允许的请求尝试已耗尽，未取得页面")
+                await self._handle_exhausted(state, request_start_time)
             return CrawlerResponse(data=data, debug_info=ctx.debug_info)
         except TimeoutError:
             reason = (
@@ -232,12 +233,15 @@ class GenericBaseCrawler[T: Context = Context](ABC):
             )
             ctx.debug(reason)
             ctx.debug_info.error = TimeoutError(reason)
+            # 只有已出现网络类请求失败、随后重试/墙钟耗尽时才计 1 次; 单纯排队、冷却、403 退避中的超时不算站点失败
+            if state.network_failure and not state.is_ban_failure:
+                await self._record_network_failure(request_start_time)
             return CrawlerResponse(debug_info=ctx.debug_info)
         except Exception as e:
             ctx.debug(traceback.format_exc())
             ctx.debug_info.error = e
             if state.request_failed and not state.is_ban_failure:
-                self._open_circuit("允许的请求尝试已耗尽，未取得页面")
+                await self._handle_exhausted(state, request_start_time)
             return CrawlerResponse(debug_info=ctx.debug_info)
         finally:
             budget.active -= 1
@@ -245,6 +249,23 @@ class GenericBaseCrawler[T: Context = Context](ABC):
                 budget.remaining = max(budget.deadline - loop.time(), 0)
             crawl_request_state.reset(token)
             ctx.debug_info.execution_time = time.time() - start_time
+
+    def _client_time(self) -> float:
+        get_time = getattr(self.async_client, "_get_time", None)
+        return get_time() if callable(get_time) else time.time()
+
+    async def _record_network_failure(self, request_start_time: float) -> None:
+        """网络类失败 / 墙钟耗尽: 这部片该站失败 1 次, 暂停 60 秒, 与 403、CF/bypass 失败共用连续失败计数."""
+        record = getattr(self.async_client, "_record_site_ban_failure", None)
+        if record is None:
+            return
+        await record(self.site().value, status_code=None, request_start_time=request_start_time, network=True)
+
+    async def _handle_exhausted(self, state: CrawlRequestState, request_start_time: float) -> None:
+        if state.network_failure:
+            await self._record_network_failure(request_start_time)
+        else:
+            self._open_circuit("允许的请求尝试已耗尽，未取得页面")
 
     def _open_circuit(self, reason: str) -> None:
         if not self._site_failure:
