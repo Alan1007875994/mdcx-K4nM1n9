@@ -17,6 +17,30 @@ from ..utils import get_used_time
 from ..utils.video import get_video_metadata
 from .naming import NameRenderOptions, NamingTarget, render_name
 
+_ACTOR_SEPARATORS = " \u3000"  # 半角空格、全角空格
+
+
+def strip_trailing_actor_names(text: str, actor_names: list[str]) -> str:
+    """反复从末尾去除已知演员名及其前面的分隔空白，直到一整轮都没有去除为止。
+
+    只处理末尾；去除后若只剩演员名（整段都是演员名），保留原文。
+    """
+    names = {name for name in actor_names if name}
+    result = text
+    changed = True
+    while changed:
+        changed = False
+        for name in names:
+            if not result.endswith(name):
+                continue
+            head = result[: -len(name)]
+            if head and head[-1] in _ACTOR_SEPARATORS:
+                result = head.rstrip(_ACTOR_SEPARATORS)
+                changed = True
+    if not result or result in names:
+        return text
+    return result
+
 
 def replace_word(json_data: BaseCrawlerResult):
     # 常见字段替换的字符
@@ -101,9 +125,8 @@ def deal_some_field(json_data: CrawlersResult):
                 # 获取演员映射表的所有演员别名进行替换
                 actor_keyword_list: list[str] = resources.get_actor_data(each_actor).get("keyword", [])
                 new_all_actor_name_list.extend(actor_keyword_list)
-            for each_actor in set(new_all_actor_name_list):
-                title = title.removesuffix(f" {each_actor}")
-                originaltitle = originaltitle.removesuffix(f" {each_actor}")
+            title = strip_trailing_actor_names(title, new_all_actor_name_list)
+            originaltitle = strip_trailing_actor_names(originaltitle, new_all_actor_name_list)
         json_data.title = title.strip()
         json_data.originaltitle = originaltitle.strip()
 
