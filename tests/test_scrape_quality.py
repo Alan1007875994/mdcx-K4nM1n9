@@ -117,9 +117,15 @@ class QualityCrawler(BaseCrawler):
         data = CrawlerResult.empty()
         data.title = "sample"
         data.source = self.site().value
-        if action == "full":
+        if action == "empty":
+            # Normal absence of other fields remains accepted; actor absence is tested separately.
+            data.actors = ["sample actor"]
+        if action in {"full", "actor_empty", "actor_placeholder"}:
             data.score, data.score_max = "4.5", "5"
             data.outline, data.actors, data.thumb = "sample outline", ["sample actor"], "https://example.test/cover.jpg"
+            if action != "full":
+                data.actors = [] if action == "actor_empty" else ["未知演员", "---"]
+                data.all_actors = list(data.actors)
         return data
 
     async def _generate_search_url(self, ctx): ...
@@ -466,6 +472,7 @@ async def test_parse_error_invalidates_successful_download_cache(monkeypatch):
                 record_parse_error("malformed detail")
             result = CrawlerResult.empty()
             result.title = body
+            result.actors = ["sample actor"]
             return result
 
     crawler = Parsing(Website.DMM, [], [])
@@ -675,3 +682,138 @@ async def test_batch_normal_absence_uses_merged_required_fields(gate_env, monkey
         assert len(batch.missing_movies - batch.abnormal_movies) == expected
     finally:
         batch_diagnostics.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action,reason", [("actor_empty", "演员解析为空"), ("actor_placeholder", "演员全是占位名")])
+@pytest.mark.parametrize("kind", [FixedScrapingType.YOUMA, FixedScrapingType.WUMA])
+async def test_invalid_actors_defer_then_hold_before_any_output(gate_env, monkeypatch, tmp_path, action, reason, kind):
+    module, info = gate_env
+    monkeypatch.setattr(module.manager.config, "fixed_scraping_type", kind)
+    monkeypatch.setattr(module.manager.config, "website_wuma", [Website.DMM, Website.JAVDB])
+    source, records = provider([action, action], [action, action])
+    info.file_path.write_bytes(b"original")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("actor quality gate allowed output")
+
+    for name in [
+        "show_result",
+        "translate_title_outline",
+        "get_output_name",
+        "creat_folder",
+        "write_nfo",
+        "poster_download",
+        "thumb_download",
+        "fanart_download",
+        "move_movie",
+    ]:
+        monkeypatch.setattr(module, name, forbidden)
+    scraper = module.Scraper(source)
+    with pytest.raises(QualityDeferred):
+        await scraper._process_one_file(info, FileMode.Default)
+    assert missing_required(scraper._quality_pending[info.file_path].raw_result, kind) == ["actors"]
+    scraper._quality_retrying = True
+    with pytest.raises(QualityHeld, match=reason):
+        await scraper._process_one_file(info, FileMode.Default)
+    assert len(records) == 4  # Empty source responses must be parsed again, not reused as successes.
+    assert list(tmp_path.iterdir()) == [info.file_path]
+    assert info.file_path.read_bytes() == b"original"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [FixedScrapingType.SUREN, FixedScrapingType.FC2])
+async def test_optional_actors_do_not_create_parse_error(monkeypatch, kind):
+    config = configure(monkeypatch)
+    config.fixed_scraping_type = kind
+    source, _ = provider(["actor_placeholder"], [])
+    scraper = FileScraper(config, source)
+    response = await scraper._call_crawler(task(), Website.DMM, scraping_type=kind)
+    assert response.data.actors == response.data.all_actors == []
+    assert not response.report.has_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["full", "actor_empty"])
+async def test_actor_error_allows_recovery_or_valid_secondary(monkeypatch, recovery):
+    config = configure(monkeypatch)
+    source, _ = provider(["actor_empty", recovery], ["full"])
+    scraper = FileScraper(config, source)
+    await scraper.run(task(), FileMode.Default)
+    assert any(report.has_error for report in scraper.reports)
+    await scraper.run(task(), FileMode.Default)
+    assert not missing_required(scraper.raw_result, FixedScrapingType.YOUMA)
+    assert scraper.raw_result.field_sources[CrawlerResultFields.ACTORS] == ("dmm" if recovery == "full" else "javdb")
+
+
+def test_actor_filter_preserves_real_names_including_mapping_entries(monkeypatch):
+    from lxml import etree
+
+    from mdcx.config.resources import resources
+    from mdcx.core.actor_quality import ACTOR_PLACEHOLDERS, valid_actor_names
+
+    xml = etree.parse(str(Path(__file__).parents[1] / "resources/mapping_table/mapping_actor.xml"))
+    mapped = xml.xpath("//a/@jp")[0]
+    monkeypatch.setattr(resources, "actor_mapping_data", etree.HTML(etree.tostring(xml)))
+    assert resources.get_actor_data(mapped)["has_name"]
+    real = [mapped, "A☆B", "sample actor", "123"]
+    assert valid_actor_names([*ACTOR_PLACEHOLDERS, "", "  ", "---", "？？", *real]) == real
+    assert valid_actor_names(["未知を含む名前"]) == ["未知を含む名前"]
+
+
+@pytest.mark.asyncio
+async def test_actor_parse_errors_do_not_increment_network_or_service_failures(monkeypatch):
+    from mdcx.models.crawl_status import BatchDiagnostics, batch_diagnostics
+    from mdcx.web_async import AsyncWebClient
+    from tests.crawlers.test_javlibrary_429_backoff import FakeResponse
+
+    config = configure(monkeypatch)
+    source, _ = provider(["actor_empty"] * 3, [])
+    client = AsyncWebClient(timeout=10, cf_bypass_url="", log_fn=lambda _: None)
+
+    async def transport(**kwargs):
+        return FakeResponse(status_code=200, content=b"ok", url=str(kwargs["url"]))
+
+    client._curl_request = transport
+    crawler = source.crawlers[Website.DMM]
+    crawler.async_client = client
+    original_run = crawler._run
+
+    async def run(ctx):
+        await client.get_text("https://example.test/detail")
+        return await original_run(ctx)
+
+    crawler._run = run
+    batch = BatchDiagnostics()
+    token = batch_diagnostics.set(batch)
+    try:
+        for i in range(3):
+            value = task()
+            value.number = f"TEST-{i}"
+            response = await FileScraper(config, source)._call_crawler(
+                value, Website.DMM, scraping_type=FixedScrapingType.YOUMA
+            )
+            assert response.report.has_error
+            assert all(issue.status != CrawlStatus.REQUEST_ERROR for issue in response.report.issues)
+        assert batch.parse_errors["dmm"] == 3
+        assert not any(batch.service_streaks.values())
+        assert not batch.stop_reason
+        assert not crawler.is_stopped()
+        assert all(state.failure_count == 0 for state in client._site_ban_states.values())
+    finally:
+        batch_diagnostics.reset(token)
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["info", "speed", "single"])
+async def test_actor_quality_applies_to_each_scraping_mode(monkeypatch, mode):
+    config = configure(monkeypatch)
+    config.scrape_like = mode
+    config.website_single = Website.DMM
+    source, _ = provider(["actor_placeholder"], ["actor_placeholder"])
+    scraper = FileScraper(config, source)
+    await scraper.run(task(), FileMode.Default)
+    assert any(report.has_error for report in scraper.reports)
+    assert scraper.raw_result.actors == []
+    assert scraper.raw_result.all_actors == []

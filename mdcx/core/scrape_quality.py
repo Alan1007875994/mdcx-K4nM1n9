@@ -5,6 +5,7 @@ import re
 from ..config.enums import FixedScrapingType, Website
 from ..models.crawl_status import ERROR_STATUSES, CrawlStatus
 from ..models.types import score_to_10
+from .actor_quality import valid_actor_names
 
 REQUIRED_FIELDS = {
     FixedScrapingType.YOUMA: ("score", "outline", "actors", "thumb"),
@@ -28,7 +29,7 @@ def missing_required(result, scraping_type):
     for name in REQUIRED_FIELDS.get(scraping_type, ()):
         value = getattr(result, name, None)
         if name == "actors" and value:
-            value = any(str(actor).strip() for actor in value)
+            value = valid_actor_names(value)
         elif name == "score" and result:
             value = score_to_10(result.score, result.score_max)
         elif isinstance(value, str):

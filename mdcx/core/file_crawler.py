@@ -9,14 +9,16 @@ from ..config.enums import FixedScrapingType
 from ..config.models import Language, Website
 from ..gen.field_enums import CrawlerResultFields
 from ..manual import ManualConfig
-from ..models.crawl_status import CrawlIssue, CrawlStatus, SiteReport
+from ..models.crawl_status import CrawlIssue, CrawlStatus, SiteReport, batch_diagnostics
 from ..models.enums import FileMode
 from ..models.flags import Flags
 from ..models.log_buffer import LogBuffer
 from ..models.types import CrawlerInput, CrawlerResponse, CrawlerResult, CrawlersResult, CrawlTask, score_to_10
 from ..number import is_uncensored
 from ..utils.dataclass import update
+from .actor_quality import valid_actor_names
 from .mosaic import is_guochan_mosaic, is_plain_uncensored_mosaic, normalize_mosaic
+from .scrape_quality import REQUIRED_FIELDS
 
 if TYPE_CHECKING:
     from ..config.models import Config
@@ -268,7 +270,12 @@ class FileScraper:
             crawler.reset_wall_timeout(number)
 
     async def _call_crawler(
-        self, task_input: CrawlerInput, website: Website, timeout: float | None = 30
+        self,
+        task_input: CrawlerInput,
+        website: Website,
+        timeout: float | None = 30,
+        *,
+        scraping_type: FixedScrapingType = FixedScrapingType.AUTO,
     ) -> CrawlerResponse:
         """
         调用指定网站的爬虫函数
@@ -282,6 +289,7 @@ class FileScraper:
             asyncio.TimeoutError: 如果请求超时
             Exception: 爬虫函数抛出的异常
         """
+        actor_required = "actors" in REQUIRED_FIELDS.get(scraping_type, ())
         short_number = task_input.short_number
         original_number = task_input.number
 
@@ -305,6 +313,19 @@ class FileScraper:
                     error = r.debug_info.error
                     status = getattr(error, "status", CrawlStatus.REQUEST_ERROR)
                     r.report = SiteReport(website.value, [CrawlIssue(status, str(error))] if error else [])
+                if r.data is not None:
+                    parsed_actors = r.data.actors
+                    r.data.actors = valid_actor_names(parsed_actors)
+                    r.data.all_actors = valid_actor_names(r.data.all_actors)
+                    if not r.data.actors and actor_required and r.report.missing.get("actors") != CrawlStatus.NOT_FOUND:
+                        reason = "演员全是占位名" if any(a.strip() for a in parsed_actors) else "演员解析为空"
+                        issue = CrawlIssue(CrawlStatus.PARSE_ERROR, reason)
+                        r.report.issues.append(issue)
+                        r.report.missing["actors"] = CrawlStatus.PARSE_ERROR
+                        # BaseCrawler already observed the original report. Add only this new issue.
+                        if (batch := batch_diagnostics.get()) is not None:
+                            batch.record_report(SiteReport(website.value, [issue]))
+                        LogBuffer.log().write(f"\n 🔴 {website.value}: {reason}")
                 if any(issue.status == CrawlStatus.PARSE_ERROR for issue in r.report.issues):
                     # A successfully downloaded but malformed page must be fetched again.
                     self.request_caches[key].clear()
@@ -399,7 +420,9 @@ class FileScraper:
                         if site in MULTI_LANGUAGE_WEBSITES and key[1] == Language.UNDEFINED:
                             task_input.language = Language.JP
                             task_input.org_language = Language.JP
-                        web_data = await self._call_crawler(task_input, site)
+                        web_data = await self._call_crawler(
+                            task_input, site, scraping_type=classification.scraping_type
+                        )
                         req_info.append(f"{sprint_source(*key)} ({web_data.debug_info.execution_time:.2f}s)")
                         if web_data.data is None:
                             failure_marker = "🔴" if web_data.report.has_error else "⚪"
@@ -596,14 +619,20 @@ class FileScraper:
         res.all_actors = list(dict.fromkeys(chain(res.all_actors, web_data_json.actors)))
         return res
 
-    async def _call_specific_crawler(self, task_input: CrawlerInput, website: Website) -> CrawlersResult | None:
+    async def _call_specific_crawler(
+        self,
+        task_input: CrawlerInput,
+        website: Website,
+        *,
+        scraping_type: FixedScrapingType = FixedScrapingType.AUTO,
+    ) -> CrawlersResult | None:
         file_number = task_input.number
         short_number = task_input.short_number
 
         title_language, org_language = self._get_specific_crawler_language(website)
         task_input.language = title_language
         task_input.org_language = org_language
-        web_data = await self._call_crawler(task_input, website)
+        web_data = await self._call_crawler(task_input, website, scraping_type=scraping_type)
         web_data_json = web_data.data
         if web_data_json is None:
             if e := web_data.debug_info.error:
@@ -631,7 +660,7 @@ class FileScraper:
             task_input.language = title_language
             task_input.org_language = org_language
             try:
-                web_data = await self._call_crawler(task_input, website)
+                web_data = await self._call_crawler(task_input, website, scraping_type=classification.scraping_type)
             except TimeoutError:
                 failed_info.append(f"{website.value}(请求超时)")
                 continue
@@ -674,14 +703,16 @@ class FileScraper:
                 task_input.mosaic = classification.mosaic
                 mosaic = classification.mosaic
             if classification.website:
-                res = await self._call_specific_crawler(task_input, classification.website)
+                res = await self._call_specific_crawler(
+                    task_input, classification.website, scraping_type=classification.scraping_type
+                )
             elif self.config.scrape_like == "speed":
                 res = await self._call_speed_crawlers(task_input, classification)
             else:
                 res = await self._call_crawlers(task_input, classification)
         else:
             classification = classify_scrape_task(task_input, self.config, use_fixed_type=False)
-            res = await self._call_specific_crawler(task_input, website)
+            res = await self._call_specific_crawler(task_input, website, scraping_type=classification.scraping_type)
 
         # ================================================网站请求结束================================================
         # ======================================超时或未找到返回
