@@ -180,6 +180,7 @@ class MyMAinWindow(QMainWindow):
         self._request_log_file = None
         self._taskbar_progress_active = False
         self._taskbar_progress = WindowsTaskbarProgress(signal_qt.add_log)
+        signal_qt.service_stopped.connect(self._show_service_stop)
         self.network_check_cancel_event: threading.Event | None = None
         self.network_check_future = None
         self.file_main_open_path = Path()  # 主界面打开的文件路径
@@ -1076,6 +1077,13 @@ class MyMAinWindow(QMainWindow):
         self.show_stop_info_thread()
 
     # 进度条
+    def _show_service_stop(self, reason):
+        self._update_taskbar_progress()
+        box = QMessageBox(QMessageBox.Icon.Warning, "服务异常，刮削已停止", reason, parent=self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._service_stop_box = box
+        box.open()
+
     def set_processbar(self, value):
         self.Ui.progressBar_scrape.setProperty("value", value)
         if IS_WINDOWS:
@@ -1088,6 +1096,9 @@ class MyMAinWindow(QMainWindow):
                 self._clear_taskbar_progress()
 
     def _update_taskbar_progress(self):
+        if IS_WINDOWS and Flags.service_stop_reason:
+            self._taskbar_progress.show_error(int(self.winId()), Flags.scrape_processed, Flags.total_count)
+            return
         if IS_WINDOWS and self._taskbar_progress_active:
             if Flags.stop_requested or signal_qt.stop:
                 self._clear_taskbar_progress()
@@ -1097,6 +1108,9 @@ class MyMAinWindow(QMainWindow):
     def _clear_taskbar_progress(self):
         self._taskbar_progress_active = False
         if IS_WINDOWS:
+            if Flags.service_stop_reason:
+                self._taskbar_progress.show_error(int(self.winId()), Flags.scrape_processed, Flags.total_count)
+                return
             self._taskbar_progress.clear(int(self.winId()))
 
     # region 刮削结果显示

@@ -1,8 +1,10 @@
-"""Per-call observations; recording these must never affect network retry/circuit decisions."""
+"""Per-call observations and batch service health, independent of site circuit rules."""
 
+import asyncio
 import copy
 import re
 from collections import Counter
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -115,6 +117,25 @@ class BatchDiagnostics:
     parse_errors: Counter = field(default_factory=Counter)
     abnormal_movies: set[str] = field(default_factory=set)
     missing_movies: set[str] = field(default_factory=set)
+    service_failures: Counter = field(default_factory=Counter)
+    service_streaks: Counter = field(default_factory=Counter)
+    stop_reason: str = ""
+    on_service_stop: Callable[[str], None] | None = None
+
+    def record_service(self, category: str, success: bool) -> None:
+        if self.stop_reason:
+            if not success:
+                self.service_failures[category] += 1
+            return
+        if success:
+            self.service_streaks[category] = 0
+            return
+        self.service_failures[category] += 1
+        self.service_streaks[category] += 1
+        if self.service_streaks[category] >= 3:
+            self.stop_reason = f"{category} 服务连续失败 3 次，已停止本批刮削；请检查服务后继续刮削剩余任务。"
+            if self.on_service_stop is not None:
+                self.on_service_stop(self.stop_reason)
 
     def record_bypass(self, site: str, outcome: str) -> None:
         self.bypass.setdefault(site, Counter())[outcome] += 1
@@ -133,6 +154,10 @@ class BatchDiagnostics:
 
     def lines(self, *, incomplete: bool = False) -> list[str]:
         lines = []
+        if self.stop_reason:
+            lines.append(f"诊断：{self.stop_reason}")
+        for category, count in self.service_failures.items():
+            lines.append(f"诊断：本批 {category} 服务最终失败 {count} 次。")
         successes = sum(counts["success"] for counts in self.bypass.values())
         failures = sum(counts["failure"] for counts in self.bypass.values())
         total = successes + failures
@@ -181,3 +206,12 @@ class BatchDiagnostics:
 
 
 batch_diagnostics: ContextVar[BatchDiagnostics | None] = ContextVar("batch_diagnostics", default=None)
+
+
+class ServiceStopped(asyncio.CancelledError):
+    """Abort unfinished work without being swallowed by crawler Exception handlers."""
+
+
+def check_service_stop() -> None:
+    if (batch := batch_diagnostics.get()) is not None and batch.stop_reason:
+        raise ServiceStopped(batch.stop_reason)

@@ -22,12 +22,12 @@ import aiofiles.os
 import httpx
 from aiolimiter import AsyncLimiter
 from curl_cffi import AsyncSession, Response
-from curl_cffi.requests.exceptions import ConnectionError, RequestException, Timeout
+from curl_cffi.requests.exceptions import ConnectionError, ProxyError, RequestException, Timeout
 from curl_cffi.requests.session import HttpMethod
 from curl_cffi.requests.utils import not_set
 from PIL import Image
 
-from .models.crawl_status import CrawlStatus, batch_diagnostics, observe_http
+from .models.crawl_status import CrawlStatus, batch_diagnostics, check_service_stop, observe_http
 from .network_fingerprint import (
     BrowserFingerprint,
     RequestPurpose,
@@ -664,6 +664,7 @@ class AsyncWebClient:
         )
 
     async def _curl_request(self, *, fingerprint: BrowserFingerprint | None = None, **kwargs) -> Response:
+        check_service_stop()
         _check_site_circuit()
         url = str(kwargs.get("url") or "")
         site_key = self._resolve_site_key(httpx.URL(url).host or "")
@@ -685,11 +686,13 @@ class AsyncWebClient:
             if budget is not None:
                 remaining = budget.wall_deadline - asyncio.get_running_loop().time()
                 timeout_seconds = min(timeout_seconds, remaining) if timeout_seconds is not None else remaining
+            check_service_stop()
             coro = session.request(**kwargs)
             if timeout_seconds is None:
                 response = await coro
             else:
                 response = await asyncio.wait_for(coro, timeout=timeout_seconds)
+            check_service_stop()
             if kwargs.get("stream"):
                 release_now = False
                 return self._attach_stream_release(
@@ -1634,22 +1637,35 @@ class AsyncWebClient:
         return response, ""
 
     async def _try_bypass_cloudflare(self, **kwargs) -> tuple[Response | None, str]:
+        check_service_stop()
         batch = batch_diagnostics.get()
+        outcomes: dict[str, bool] = {}
         try:
-            result = await self._try_bypass_cloudflare_observed(**kwargs)
+            result = await self._try_bypass_cloudflare_observed(**kwargs, service_outcomes=outcomes)
         except asyncio.CancelledError:
             if batch is not None:
                 state = crawl_request_state.get()
                 budget = getattr(state, "budget", None)
                 wall_expired = budget is not None and asyncio.get_running_loop().time() >= budget.wall_deadline
                 batch.record_bypass(kwargs["host"], "wall_timeout" if wall_expired else "cancelled")
+                if wall_expired:
+                    for category, success in outcomes.items():
+                        batch.record_service(category, success)
+                    check_service_stop()
             raise
         except (SiteCircuitOpen, SiteWallTimeout) as error:
             if batch is not None:
                 batch.record_bypass(kwargs["host"], "skipped" if isinstance(error, SiteCircuitOpen) else "wall_timeout")
+                if isinstance(error, SiteWallTimeout):
+                    for category, success in outcomes.items():
+                        batch.record_service(category, success)
+                    check_service_stop()
             raise
         if batch is not None:
             batch.record_bypass(kwargs["host"], "success" if result[0] is not None else "failure")
+            for category, success in outcomes.items():
+                batch.record_service(category, success)
+            check_service_stop()
         return result
 
     async def _try_bypass_cloudflare_observed(
@@ -1665,7 +1681,10 @@ class AsyncWebClient:
         timeout: float | httpx.Timeout | None,
         allow_redirects: bool,
         use_proxy: bool,
+        service_outcomes: dict[str, bool] | None = None,
     ) -> tuple[Response | None, str]:
+        if service_outcomes is None:
+            service_outcomes = {}
         lock = await self._get_cf_host_lock(host)
         async with exempt_crawl_timeout():
             await lock.acquire()
@@ -1698,6 +1717,7 @@ class AsyncWebClient:
 
                 can_retry = True
                 html_bypass_cache = force_bypass_cache
+                service_outcomes["mirror"] = False
                 bypass_response, mirror_error = await self._call_bypass_mirror(
                     method=method,
                     target_url=target_url,
@@ -1711,6 +1731,7 @@ class AsyncWebClient:
                     allow_redirects=allow_redirects,
                 )
                 if bypass_response is not None:
+                    service_outcomes["mirror"] = True
                     self._cf_host_challenge_hits[host] = 0
                     return bypass_response, ""
 
@@ -1731,6 +1752,7 @@ class AsyncWebClient:
                             allow_redirects=allow_redirects,
                         )
                     if bypass_response is not None:
+                        service_outcomes["mirror"] = True
                         self._cf_host_challenge_hits[host] = 0
                         return bypass_response, ""
                     html_bypass_cache = False
@@ -1739,6 +1761,11 @@ class AsyncWebClient:
                 skip_html_fallback = mirror_status == 429 or (
                     mirror_status is not None and not self._is_retryable_status_code(mirror_status)
                 )
+                # A target's terminal 4xx is a site result, not service unavailability.
+                if mirror_status is None or mirror_status >= 500:
+                    service_outcomes["mirror"] = False
+                else:
+                    service_outcomes.pop("mirror", None)
                 if skip_html_fallback:
                     if mirror_status == 429:
                         error = "mirror 返回终态 HTTP 429，跳过 /html 回退"
@@ -1751,9 +1778,15 @@ class AsyncWebClient:
                         self._log_cf(f"↩️ mirror 失败（强刷已启用），回退 /html: {mirror_error}", host)
                     else:
                         self._log_cf(f"↩️ mirror 失败，回退 /html: {mirror_error}", host)
+                    service_outcomes["/html"] = False
                     bypass_response, html_error = await self._call_bypass_html(
                         target_url, use_proxy=use_proxy, bypass_cache=html_bypass_cache
                     )
+                    html_status = self._extract_http_status_from_bypass_error(html_error, prefix="HTTP")
+                    if bypass_response is not None or html_status is None or html_status >= 500:
+                        service_outcomes["/html"] = bypass_response is not None
+                    else:
+                        service_outcomes.pop("/html", None)
                     if bypass_response is not None:
                         self._cf_host_challenge_hits[host] = 0
                         bypass_headers = {str(k): str(v) for k, v in bypass_response.headers.items()}
@@ -1816,6 +1849,7 @@ class AsyncWebClient:
             tuple[Optional[Response], str]: (响应对象, 错误信息)
         """
         try:
+            check_service_stop()
             req_state = crawl_request_state.get()
             if req_state is not None and req_state.abandoned_error:
                 return None, req_state.abandoned_error
@@ -1851,10 +1885,13 @@ class AsyncWebClient:
             error_msg = ""
             bypass_round = 0
             bypass_failed = False
+            proxy_transport_failure = False
             allow_lifetime_rotation = purpose != "download"
             ban_retried = False
 
             for attempt in range(max(retry_count, 2) + 1):
+                check_service_stop()
+                proxy_transport_failure = False
                 # 增强的重试策略: 对网络错误和特定状态码都进行重试
                 retry = False
                 should_sleep_before_retry = True
@@ -1936,6 +1973,10 @@ class AsyncWebClient:
                             )
 
                         self._log_dmm_response(resp, url, method=str(method), stream=stream)
+                        # Any HTTP response proves this proxied connection worked,
+                        # including target-site errors and Cloudflare challenges.
+                        if request_proxy and (batch := batch_diagnostics.get()) is not None:
+                            batch.record_service("代理", True)
                         bypass_needed = bool(
                             enable_cf_bypass
                             and self._cf_bypass_enabled
@@ -2092,18 +2133,22 @@ class AsyncWebClient:
                 except (SiteCircuitOpen, SiteWallTimeout):
                     raise
                 except Timeout:
+                    proxy_transport_failure = bool(request_proxy)
                     error_msg = "连接超时"
                     retry = True  # 超时错误进行重试
                     await self._record_transport_failure(error_msg, pool_key=pool_key)
                 except ConnectionError as e:
+                    proxy_transport_failure = bool(request_proxy)
                     error_msg = f"连接错误: {str(e)}"
                     retry = True  # 连接错误进行重试
                     await self._record_transport_failure(error_msg, pool_key=pool_key)
                 except RequestException as e:
+                    proxy_transport_failure = bool(request_proxy) and isinstance(e, ProxyError)
                     error_msg = f"请求异常: {str(e)} {getattr(e, 'code', '')}".strip()
                     retry = True  # 请求异常进行重试
                     await self._record_transport_failure(error_msg, pool_key=pool_key)
                 except TimeoutError:
+                    proxy_transport_failure = bool(request_proxy)
                     error_msg = "请求等待超时"
                     retry = True
                     await self._record_transport_failure(error_msg, pool_key=pool_key)
@@ -2144,6 +2189,9 @@ class AsyncWebClient:
                             self._log_cf(f"⏳ bypass 后退避 {sleep_seconds:.2f}s", host)
                     async with exempt_crawl_timeout():
                         await self._do_sleep(sleep_seconds)
+            if proxy_transport_failure and (batch := batch_diagnostics.get()) is not None:
+                batch.record_service("代理", False)
+                check_service_stop()
             if bypass_failed and (req_state := crawl_request_state.get()) is not None:
                 # Internal bypass attempts are already exhausted; do not add another retry.
                 req_state.is_ban_failure = True

@@ -22,6 +22,7 @@ from ..base.file import (
     move_torrent,
     newtdisk_creat_symlink,
     pic_some_deal,
+    save_remain_list,
     save_success_list,
 )
 from ..base.image import extrafanart_copy2, extrafanart_extras_copy
@@ -30,7 +31,7 @@ from ..config.extend import get_movie_path_setting, parse_media_paths
 from ..config.manager import manager
 from ..config.resources import resources
 from ..crawler import CrawlerProvider
-from ..models.crawl_status import BatchDiagnostics, batch_diagnostics
+from ..models.crawl_status import BatchDiagnostics, batch_diagnostics, check_service_stop
 from ..models.enums import FileMode
 from ..models.flags import FileDoneDict, Flags
 from ..models.log_buffer import LogBuffer
@@ -127,6 +128,8 @@ class Scraper:
         running_tasks: set[asyncio.Task[None]] = set()
 
         def _submit_next_task() -> bool:
+            if signal.stop or Flags.stop_requested:
+                return False
             try:
                 index, each_file = next(task_iter)
             except StopIteration:
@@ -195,11 +198,21 @@ class Scraper:
             await self.crawler_provider.close()
 
     async def _run(self, file_mode: FileMode, movie_list: list[Path] | None) -> None:
-        token = batch_diagnostics.set(BatchDiagnostics())
+        token = batch_diagnostics.set(BatchDiagnostics(on_service_stop=self._stop_service))
         try:
             await self._run_batch(file_mode, movie_list)
         finally:
+            if Flags.service_stop_reason:
+                save_remain_list()
+                signal.reset_buttons_status.emit()
             batch_diagnostics.reset(token)
+
+    def _stop_service(self, reason: str) -> None:
+        Flags.service_stop_reason = reason
+        Flags.stop_requested = True
+        signal.show_log_text(f'<font color="red">⛔️ {reason}</font>')
+        signal.show_scrape_info(f"⛔️ {reason}")
+        signal.service_stopped.emit(reason)
 
     async def _run_batch(self, file_mode: FileMode, movie_list: list[Path] | None) -> None:
         Flags.reset()
@@ -386,6 +399,7 @@ class Scraper:
             signal.exec_exit_app.emit()
 
     async def process_one_file(self, task: tuple[Path, int, int]) -> None:
+        self._check_stop("开始处理")
         # Explicit/resumed tasks also bypass site search for quarantined or matched files.
         file_path, count, count_all = task
         if _is_garbage_directory(file_path.parent) or (
@@ -515,6 +529,7 @@ class Scraper:
             LogBuffer.log().write("\n" + traceback.format_exc())
 
         # 显示刮削数据
+        self._check_stop(show_name)
         try:
             show_data = ShowData.empty()
             show_data.file_info = file_info
@@ -850,6 +865,7 @@ class Scraper:
                         )
             else:
                 res = await scraper.run(crawl_task, file_mode)
+            self._check_stop(file_info.file_show_name)
             if (batch := batch_diagnostics.get()) is not None:
                 batch.record_movie(
                     movie_number or str(file_path),
@@ -1084,6 +1100,7 @@ class Scraper:
         return res, other
 
     def _check_stop(self, show_name: str) -> None:
+        check_service_stop()
         if signal.stop or Flags.stop_requested:
             Flags.now_kill += 1
             signal.show_log_text(
@@ -1103,6 +1120,7 @@ class Scraper:
 
 def start_new_scrape(file_mode: FileMode, movie_list: list[Path] | None = None) -> None:
     Flags.stop_requested = False
+    Flags.service_stop_reason = ""
     signal.stop = False
     signal.change_buttons_status.emit()
     signal.exec_set_processbar.emit(0)

@@ -97,8 +97,15 @@ def test_com_vtable_uses_64_bit_counts_and_releases(monkeypatch):
     api = taskbar._TaskbarAPI()
     api.set_progress(2**40, 2**33, 2**34)
     api.clear(2**40)
+    api.set_error(2**40)
     api.close()
-    assert calls == [("init",), ("progress", 2**40, 2**33, 2**34), ("clear", 2**40, 0), ("release",)]
+    assert calls == [
+        ("init",),
+        ("progress", 2**40, 2**33, 2**34),
+        ("clear", 2**40, 0),
+        ("clear", 2**40, 4),
+        ("release",),
+    ]
     ole.CoUninitialize.assert_called_once()
 
 
@@ -129,3 +136,20 @@ def test_window_taskbar_uses_first_pass_display_count(monkeypatch):
     window._taskbar_progress.update.assert_called_with(123, 200, 200)
     module.MyMAinWindow.set_processbar(window, 0)
     window._taskbar_progress.clear.assert_called_once_with(123)
+
+
+def test_service_error_stays_red_through_explorer_recreation_and_clears_for_next_batch(progress):
+    bar, api, _ = progress
+    bar.show_error(123, 0, 3)
+    api.set_progress.assert_called_once_with(123, 1, 3)
+    api.set_error.assert_called_once_with(123)
+    from ctypes.wintypes import MSG
+
+    message = MSG()
+    message.message = bar.message_id
+    bar.native_message(ctypes.addressof(message))
+    assert api.set_error.call_count == 2
+    bar.clear(123)
+    assert not bar.error
+    bar.update(123, 1, 3)
+    assert api.set_error.call_count == 2

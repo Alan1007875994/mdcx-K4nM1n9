@@ -64,6 +64,9 @@ class _TaskbarAPI:
     def clear(self, hwnd):
         self._call(10, hwnd, 0, types=(ctypes.c_void_p, ctypes.c_uint32))  # TBPF_NOPROGRESS
 
+    def set_error(self, hwnd):
+        self._call(10, hwnd, 4, types=(ctypes.c_void_p, ctypes.c_uint32))  # TBPF_ERROR
+
     def close(self):
         if self.pointer:
             self._call(2, result_type=ctypes.c_uint32)  # Release
@@ -84,6 +87,7 @@ class WindowsTaskbarProgress:
         self.disabled = not IS_WINDOWS
         self.pending = None
         self.last = None
+        self.error = False
         if IS_WINDOWS:
             try:
                 user32 = ctypes.WinDLL("user32")
@@ -120,7 +124,14 @@ class WindowsTaskbarProgress:
         self.pending = (hwnd, completed, total)
         self._apply()
 
+    def show_error(self, hwnd, completed, total):
+        if not self.error:
+            self.last = None
+        self.error = True
+        self.update(hwnd, max(1, completed), max(1, total))
+
     def clear(self, hwnd):
+        self.error = False
         self.update(hwnd, 0, 0)
 
     def _apply(self):
@@ -132,6 +143,8 @@ class WindowsTaskbarProgress:
             hwnd, completed, total = self.pending
             if total:
                 self.api.set_progress(hwnd, completed, total)
+                if self.error:
+                    self.api.set_error(hwnd)
             else:
                 self.api.clear(hwnd)
             self.last = self.pending

@@ -76,6 +76,7 @@ class _Flags:
     success_list: set[Path] = field(default_factory=set)
     stop_other: bool = True  # 非刮削线程停止标识
     stop_requested: bool = False  # 手动停止刮削请求标识
+    service_stop_reason: str = ""
 
     # show
     log_txt: Any = None  # 日志文件对象
@@ -113,6 +114,7 @@ class _Flags:
         self.json_data_dic = {}
         self.img_path = ""
         self.stop_requested = False
+        self.service_stop_reason = ""
 
 
 Flags = _Flags()
