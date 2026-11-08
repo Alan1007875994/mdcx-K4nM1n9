@@ -28,6 +28,9 @@ class Parser(DetailPageParser):
         return extract_text(html, 'string(//h2[@class="title is-4"]/span[@class="origin-title"])')
 
     async def actors(self, ctx, html: Selector) -> list[str]:
+        actors = html.css("span.value > a.actor-female::text").getall()
+        if actors:
+            return actors
         # parsel css 不支持 :has() 中的多个选择器, 这是一个已知问题: https://github.com/scrapy/cssselect/issues/138
         return (
             html.css("span:has(strong.female)")
@@ -36,6 +39,9 @@ class Parser(DetailPageParser):
         )
 
     async def all_actors(self, ctx, html: Selector) -> list[str]:
+        actors = html.css("span.value:has(a.actor-female)").xpath("a/text()").getall()
+        if actors:
+            return actors
         return (html.css("span:has(strong.female)") or html.css("span:has(strong.male)")).xpath("a/text()").getall()
 
     async def studio(self, ctx, html: Selector) -> str:
