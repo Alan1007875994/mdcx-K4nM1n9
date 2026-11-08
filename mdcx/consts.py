@@ -2,7 +2,7 @@ import platform
 import sys
 from pathlib import Path
 
-LOCAL_VERSION = "v1.3.2"
+LOCAL_VERSION = "v1.3.3"
 
 GITHUB_REPO = "Marcus515J/mdcx"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
