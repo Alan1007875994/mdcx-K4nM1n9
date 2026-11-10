@@ -259,6 +259,13 @@ def test_issue_35_acceptance_steps_ui_terms():
         assert text == expected_text, f"Widget {obj_name} text '{text}' does not match '{expected_text}'"
 
 
+def test_issue_173_network_check_acceptance_ui_terms():
+    root = ET.parse("mdcx/views/MDCx.ui").getroot()
+    for name, expected in (("pushButton_net", "检测网络"), ("pushButton_check_net", "开始检测")):
+        node = root.find(f'.//widget[@name="{name}"]/property[@name="text"]/string')
+        assert node is not None and node.text.strip() == expected
+
+
 def test_issue_40_acceptance_steps_ui_terms():
     root = ET.parse("mdcx/views/MDCx.ui").getroot()
     checks = [

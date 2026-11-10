@@ -185,11 +185,12 @@ def _classify_http_result(spec: NetworkCheckSpec, status_code: int, text: str) -
             return NetworkCheckStatus.FAILED, f"当前 IP {ip_text}被 JavDB 封禁"
         if "Due to copyright restrictions" in text or "Access denied" in text:
             return NetworkCheckStatus.FAILED, "当前 IP 被 JavDB 限制，请使用非日本节点"
-        if "/logout" in text:
+        if 200 <= status_code < 400 and "/logout" in text:
             return NetworkCheckStatus.OK, "连接正常，Cookie 有效"
-        if manager.config.javdb:
-            return NetworkCheckStatus.WARNING, "站点可访问，但 JavDB Cookie 可能无效"
-        return NetworkCheckStatus.OK, "连接正常"
+        if 200 <= status_code < 400:
+            if manager.config.javdb:
+                return NetworkCheckStatus.WARNING, "站点可访问，但页面未见登录标记，无法确认 JavDB 登录状态"
+            return NetworkCheckStatus.OK, "连接正常"
 
     if spec.site == Website.JAVBUS:
         manager = _manager()
@@ -475,16 +476,25 @@ async def run_network_check_item(
     start_time = time.perf_counter()
     try:
         request_client = client or _manager().computed.async_client
-        response, error = await request_client.request(
-            spec.method,
-            spec.url,
-            headers=spec.headers or None,
-            cookies=spec.cookies or None,
-            use_proxy=spec.use_proxy,
-            timeout=_check_timeout(spec),
-            retry_count=1,
-            enable_cf_bypass=spec.enable_cf_bypass and bool(_manager().config.cf_bypass_url.strip()),
-        )
+        for attempt in range(2):
+            response, error = await request_client.request(
+                spec.method,
+                spec.url,
+                headers=spec.headers or None,
+                cookies=spec.cookies or None,
+                use_proxy=spec.use_proxy,
+                timeout=_check_timeout(spec),
+                retry_count=1,
+                enable_cf_bypass=spec.enable_cf_bypass and bool(_manager().config.cf_bypass_url.strip()),
+            )
+            if cancel_event and cancel_event.is_set():
+                break
+            # Diagnostics only: keep crawler retry and ban policies unchanged.
+            bad_gateway = (
+                response.status_code == 502 if response is not None else bool(re.search(r"\bHTTP 502\b", error))
+            )
+            if not bad_gateway or attempt == 1:
+                break
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         if cancel_event and cancel_event.is_set():
             return NetworkCheckResult(spec=spec, status=NetworkCheckStatus.CANCELLED, message="已取消")

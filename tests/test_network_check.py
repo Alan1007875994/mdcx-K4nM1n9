@@ -127,6 +127,82 @@ async def test_run_network_check_item_catches_single_item_exception():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("response_shape", ["response", "error"])
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_network_check_retries_502_once(response_shape, recovers):
+    class GatewayClient(FakeClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append(kwargs)
+            if recovers and len(self.calls) == 2:
+                return FakeResponse(), ""
+            if response_shape == "error":
+                return None, f"GET {url} 失败: HTTP 502"
+            return FakeResponse(status_code=502), ""
+
+    client = GatewayClient()
+    result = await run_network_check_item(
+        NetworkCheckSpec(name="javdb", group="刮削站点", site=Website.JAVDB, url="https://example.test"),
+        client=client,
+    )
+    assert len(client.calls) == 2
+    assert all(call["retry_count"] == 1 for call in client.calls)
+    assert result.status == (NetworkCheckStatus.OK if recovers else NetworkCheckStatus.FAILED)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [200, 400, 401, 403, 429, 500, 523])
+async def test_network_check_does_not_add_retries_for_other_statuses(status_code):
+    class StatusClient(FakeClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append(kwargs)
+            return FakeResponse(status_code=status_code), ""
+
+    client = StatusClient()
+    await run_network_check_item(
+        NetworkCheckSpec(name="site", group="刮削站点", url="https://example.test"), client=client
+    )
+    assert len(client.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_network_check_cancel_after_502_skips_retry():
+    cancel_event = threading.Event()
+
+    class CancelClient(FakeClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append(kwargs)
+            cancel_event.set()
+            return FakeResponse(status_code=502), ""
+
+    client = CancelClient()
+    result = await run_network_check_item(
+        NetworkCheckSpec(name="site", group="刮削站点", url="https://example.test"),
+        client=client,
+        cancel_event=cancel_event,
+    )
+    assert len(client.calls) == 1
+    assert result.status == NetworkCheckStatus.CANCELLED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("text,expected", [("<html>ok</html>", "无法确认 JavDB 登录状态"), ("/logout", "Cookie 有效")])
+async def test_javdb_login_message_does_not_infer_cookie_expiry(monkeypatch, text, expected):
+    config = FakeConfig()
+    config.javdb = "test-cookie"
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: SimpleNamespace(config=config))
+
+    class LoginClient(FakeClient):
+        async def request(self, method, url, **kwargs):
+            return FakeResponse(text=text), ""
+
+    result = await run_network_check_item(
+        NetworkCheckSpec(name="javdb", group="刮削站点", site=Website.JAVDB, url="https://example.test"),
+        client=LoginClient(),
+    )
+    assert expected in result.message
+
+
+@pytest.mark.anyio
 async def test_run_network_check_does_not_stop_on_single_item_exception(monkeypatch: pytest.MonkeyPatch):
     async def fake_specs():
         return [

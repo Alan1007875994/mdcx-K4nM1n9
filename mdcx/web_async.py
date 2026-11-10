@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import os
 import random
 import re
@@ -1551,6 +1552,23 @@ class AsyncWebClient:
                 return None, "mirror 返回 Cloudflare 挑战页"
 
             if response.status_code >= 400:
+                if 400 <= response.status_code < 500:
+                    # Only known service validation messages are safe to report.
+                    # Never log arbitrary upstream bodies (which may contain credentials).
+                    try:
+                        payload = json.loads(response.content)
+                        detail = payload.get("detail") if isinstance(payload, dict) else None
+                    except (ValueError, TypeError, UnicodeError):
+                        detail = None
+                    if detail in (
+                        "Invalid or unsafe hostname - localhost and private IPs are not allowed",
+                        "x-hostname header is required for request mirroring",
+                        "x-proxy must start with http://, https://, socks4://, or socks5://",
+                    ):
+                        return None, (
+                            f"mirror 服务拒绝（HTTP {response.status_code}）: {detail}；"
+                            "请检查 bypass 部署的 DNS、真实公网解析及请求头"
+                        )
                 return None, f"mirror HTTP {response.status_code}"
 
             if not allow_redirects or not self._is_redirect_response(response):

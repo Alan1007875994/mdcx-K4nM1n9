@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 from types import SimpleNamespace
 
@@ -48,6 +49,68 @@ def _patch_session_request(client: AsyncWebClient, request):
             return result
 
     client._pool_manager._session_factory = FakeSession  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("html_ok", [True, False])
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Invalid or unsafe hostname - localhost and private IPs are not allowed",
+        "x-hostname header is required for request mirroring",
+        "x-proxy must start with http://, https://, socks4://, or socks5://",
+    ],
+)
+async def test_mirror_service_rejection_falls_back_to_html(detail, html_ok):
+    client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
+    calls = []
+
+    async def mirror_request(**kwargs):
+        calls.append("mirror")
+        return _fake_response(status_code=400, content=json.dumps({"detail": detail}).encode())
+
+    async def html_request(target_url, **kwargs):
+        calls.append("html")
+        if html_ok:
+            return _fake_response(status_code=200), ""
+        return None, "HTTP 500"
+
+    _patch_session_request(client, mirror_request)
+    client._call_bypass_html = html_request
+    try:
+        response, error = await client._try_bypass_cloudflare(
+            host="example.test", target_url="https://example.test", **_default_try_kwargs()
+        )
+        assert calls == ["mirror", "html"]
+        if html_ok:
+            assert response is not None
+            assert error == ""
+        else:
+            assert response is None
+            assert detail in error
+            assert "请检查 bypass 部署" in error
+        assert client._extract_terminal_bypass_status(error) is None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"site error", b'{"detail":"private secret"}', b'{"detail":[]}', b"[]", b"\xff"])
+async def test_mirror_unknown_4xx_body_is_not_logged_or_classified_as_deployment(body):
+    client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
+
+    async def mirror_request(**kwargs):
+        return _fake_response(status_code=400, content=body)
+
+    _patch_session_request(client, mirror_request)
+    try:
+        response, error = await client._call_bypass_mirror(
+            method="GET", target_url="https://example.test", headers=None, cookies=None, use_proxy=False
+        )
+        assert response is None
+        assert error == "mirror HTTP 400"
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
