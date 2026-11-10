@@ -64,6 +64,7 @@ class FakeConfig:
     cf_bypass_url = ""
     cf_bypass_proxy = ""
     timeout = 5
+    cf_bypass_timeout = 90
     javdb = ""
     javbus = ""
     theporndb_api_token = ""
@@ -259,3 +260,53 @@ async def test_run_network_check_item_reports_cf_bypass_failure(monkeypatch: pyt
     assert result.status == NetworkCheckStatus.FAILED
     assert result.message == "Cloudflare Bypass 失败"
     assert result.error == "bypass failed"
+
+
+@pytest.mark.anyio
+async def test_cf_bypass_health_check_waits_for_cookie_generation():
+    spec = NetworkCheckSpec(
+        name="CF Bypass",
+        group="辅助服务",
+        url="http://bypass.example/cookies?url=http://example.com",
+        use_proxy=False,
+    )
+    client = FakeClient()
+
+    result = await run_network_check_item(spec, client=client)
+
+    assert result.status == NetworkCheckStatus.OK
+    assert result.message == "Cookie 检测通过"
+    assert client.calls[0]["timeout"] == 90
+
+
+@pytest.mark.anyio
+async def test_cf_bypass_health_check_keeps_longer_diagnostic_timeout(monkeypatch: pytest.MonkeyPatch):
+    class ShortBypassConfig(FakeConfig):
+        cf_bypass_timeout = 1
+
+    class ShortBypassManager:
+        config = ShortBypassConfig()
+        computed = None
+
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: ShortBypassManager())
+    spec = NetworkCheckSpec(
+        name="CF Bypass",
+        group="辅助服务",
+        url="http://bypass.example/cookies?url=http://example.com",
+        use_proxy=False,
+    )
+    client = FakeClient()
+
+    await run_network_check_item(spec, client=client)
+
+    assert client.calls[0]["timeout"] == 5.0
+
+
+@pytest.mark.anyio
+async def test_site_check_keeps_diagnostic_timeout():
+    spec = NetworkCheckSpec(name="site", group="刮削站点", url="https://example.test")
+    client = FakeClient()
+
+    await run_network_check_item(spec, client=client)
+
+    assert client.calls[0]["timeout"] == 5.0

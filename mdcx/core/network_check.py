@@ -120,6 +120,15 @@ def _diagnostic_timeout() -> float:
     return max(min(float(manager.config.timeout or 5), 5.0), 2.0)
 
 
+def _check_timeout(spec: NetworkCheckSpec) -> float:
+    """CF Bypass 健康检查要生成 cookie，复用已有的 bypass 等待预算；其余项保持短超时。"""
+    timeout = _diagnostic_timeout()
+    if spec.name == "CF Bypass" and spec.group == "辅助服务":
+        bypass_timeout = float(getattr(_manager().config, "cf_bypass_timeout", 0) or 0)
+        timeout = max(timeout, bypass_timeout)
+    return timeout
+
+
 def _is_cloudflare_challenge(text: str) -> bool:
     lowered = text.lower()
     challenge_markers = (
@@ -472,7 +481,7 @@ async def run_network_check_item(
             headers=spec.headers or None,
             cookies=spec.cookies or None,
             use_proxy=spec.use_proxy,
-            timeout=_diagnostic_timeout(),
+            timeout=_check_timeout(spec),
             retry_count=1,
             enable_cf_bypass=spec.enable_cf_bypass and bool(_manager().config.cf_bypass_url.strip()),
         )
@@ -556,7 +565,7 @@ async def run_network_check_item(
         elif spec.validator == "javdbapi":
             status, message = _classify_javdbapi(int(response.status_code), text)
         elif spec.name == "CF Bypass" and status == NetworkCheckStatus.OK:
-            message = "服务可用"
+            message = "Cookie 检测通过"
 
         return NetworkCheckResult(
             spec=spec,
