@@ -116,6 +116,26 @@ async def test_build_network_check_specs_uses_registered_sites_without_key_error
 
 
 @pytest.mark.anyio
+async def test_kin8_network_check_uses_site_homepage(monkeypatch: pytest.MonkeyPatch):
+    class Kin8Crawler:
+        @classmethod
+        def base_url_(cls):
+            return "https://www.kin8tengoku.com"
+
+    fake_crawlers = SimpleNamespace(
+        get_registered_crawler_sites=lambda include_hidden=False: [Website.KIN8],
+        get_crawler=lambda site: Kin8Crawler,
+    )
+    monkeypatch.setitem(sys.modules, "mdcx.crawlers", fake_crawlers)
+
+    specs = await build_network_check_specs()
+
+    kin8 = next(spec for spec in specs if spec.site == Website.KIN8)
+    assert kin8.url == "https://www.kin8tengoku.com/"
+    assert "/moviepages/3681/index.html" not in kin8.url
+
+
+@pytest.mark.anyio
 async def test_run_network_check_item_catches_single_item_exception():
     spec = NetworkCheckSpec(name="bad", group="刮削站点", url="https://bad.example")
 
