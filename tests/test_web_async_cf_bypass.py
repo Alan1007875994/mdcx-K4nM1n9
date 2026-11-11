@@ -488,6 +488,91 @@ async def test_try_bypass_cloudflare_force_refresh_mirror_before_html_fallback()
 
 
 @pytest.mark.asyncio
+async def test_javdb_user_cookie_skips_html_fallback_that_cannot_forward_cookie():
+    client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
+    mirror_headers: list[dict[str, str]] = []
+    html_calls = 0
+
+    async def fake_call_bypass_mirror(**kwargs):
+        mirror_headers.append(dict(kwargs.get("headers") or {}))
+        return None, "mirror failed"
+
+    async def fake_call_bypass_html(target_url: str, *, use_proxy: bool, bypass_cache: bool = False):
+        nonlocal html_calls
+        html_calls += 1
+        return _fake_response(status_code=200, content=b"<html>ok</html>"), ""
+
+    client._call_bypass_mirror = fake_call_bypass_mirror  # type: ignore[method-assign]
+    client._call_bypass_html = fake_call_bypass_html  # type: ignore[method-assign]
+
+    response, error = await client._try_bypass_cloudflare(
+        host="javdb.com",
+        target_url="https://javdb.com/search?q=SNOS-040&locale=zh",
+        **(_default_try_kwargs() | {"headers": {"cookie": "sid=secret"}}),
+    )
+
+    assert response is None
+    assert html_calls == 0
+    assert "不支持传 Cookie" in error
+    assert "sid=secret" not in error
+    assert mirror_headers and all(headers.get("cookie") == "sid=secret" for headers in mirror_headers)
+
+
+@pytest.mark.asyncio
+async def test_javdb_without_user_cookie_still_uses_html_fallback():
+    client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
+    html_calls = 0
+
+    async def fake_call_bypass_mirror(**kwargs):
+        return None, "mirror failed"
+
+    async def fake_call_bypass_html(target_url: str, *, use_proxy: bool, bypass_cache: bool = False):
+        nonlocal html_calls
+        html_calls += 1
+        return _fake_response(status_code=200, content=b"<html>ok</html>"), ""
+
+    client._call_bypass_mirror = fake_call_bypass_mirror  # type: ignore[method-assign]
+    client._call_bypass_html = fake_call_bypass_html  # type: ignore[method-assign]
+
+    response, error = await client._try_bypass_cloudflare(
+        host="javdb.com",
+        target_url="https://javdb.com/search?q=SNOS-040&locale=zh",
+        **_default_try_kwargs(),
+    )
+
+    assert error == ""
+    assert response is not None
+    assert html_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_non_javdb_user_cookie_still_uses_html_fallback():
+    client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
+    html_calls = 0
+
+    async def fake_call_bypass_mirror(**kwargs):
+        return None, "mirror failed"
+
+    async def fake_call_bypass_html(target_url: str, *, use_proxy: bool, bypass_cache: bool = False):
+        nonlocal html_calls
+        html_calls += 1
+        return _fake_response(status_code=200, content=b"<html>ok</html>"), ""
+
+    client._call_bypass_mirror = fake_call_bypass_mirror  # type: ignore[method-assign]
+    client._call_bypass_html = fake_call_bypass_html  # type: ignore[method-assign]
+
+    response, error = await client._try_bypass_cloudflare(
+        host="missav.ws",
+        target_url="https://missav.ws/SNOS-040/cn",
+        **(_default_try_kwargs() | {"headers": {"cookie": "sid=secret"}}),
+    )
+
+    assert error == ""
+    assert response is not None
+    assert html_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_try_bypass_cloudflare_skips_html_fallback_for_terminal_mirror_http_status():
     client = AsyncWebClient(timeout=1, cf_bypass_url="http://127.0.0.1:8000")
 

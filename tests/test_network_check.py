@@ -220,6 +220,38 @@ async def test_javdb_login_message_does_not_infer_cookie_expiry(monkeypatch, tex
         client=LoginClient(),
     )
     assert expected in result.message
+    assert "过期" not in result.message
+    assert "失效" not in result.message
+
+
+@pytest.mark.anyio
+async def test_javdb_network_check_carries_configured_cookie_into_direct_and_bypass_requests(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class CookieConfig(FakeConfig):
+        cf_bypass_url = "http://0.0.0.0:8000"
+        javdb = "sid=secret"
+
+    class CookieManager:
+        config = CookieConfig()
+        computed = None
+
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: CookieManager())
+    client = FakeBypassClient()
+    spec = NetworkCheckSpec(
+        name="javdb",
+        group="刮削站点",
+        site=Website.JAVDB,
+        url="https://javdb.com/",
+        headers={"cookie": "sid=secret"},
+        enable_cf_bypass=True,
+    )
+
+    result = await run_network_check_item(spec, client=client)
+
+    assert client.calls[0]["headers"] == {"cookie": "sid=secret"}
+    assert client.bypass_calls[0]["headers"] == {"cookie": "sid=secret"}
+    assert "sid=secret" not in result.message
 
 
 @pytest.mark.anyio

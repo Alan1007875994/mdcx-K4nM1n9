@@ -1104,6 +1104,34 @@ class AsyncWebClient:
         normalized = error.strip()
         return normalized.startswith("mirror 返回 Cloudflare 挑战页") or "Cloudflare 挑战页" in normalized
 
+    def _request_has_user_cookie(
+        self,
+        *,
+        headers: dict[str, str] | None,
+        cookies: dict[str, str] | None,
+    ) -> bool:
+        """Whether this request carries a caller-supplied Cookie (never inspect/log its value)."""
+        if cookies and any(str(value).strip() for value in cookies.values() if value is not None):
+            return True
+        return bool(self._extract_header_case_insensitive(headers or {}, "cookie").strip())
+
+    def _is_javdb_host(self, host: str) -> bool:
+        normalized = (host or "").lower()
+        if "javdb" in normalized:
+            return True
+        state = crawl_request_state.get()
+        return bool(state and str(getattr(state, "site_name", "")).lower() == "javdb")
+
+    def _html_fallback_drops_javdb_cookie(
+        self,
+        *,
+        host: str,
+        headers: dict[str, str] | None,
+        cookies: dict[str, str] | None,
+    ) -> bool:
+        """The bypass /html endpoint has no Cookie parameter; never probe javdb without its session."""
+        return self._is_javdb_host(host) and self._request_has_user_cookie(headers=headers, cookies=cookies)
+
     def _bind_response_effective_url(self, response: Response, final_url: str) -> None:
         normalized = (final_url or "").strip()
         if not normalized:
@@ -1791,6 +1819,17 @@ class AsyncWebClient:
                         error = f"mirror 返回终态 HTTP {mirror_status}，跳过 /html 回退"
                     can_retry = False
                     self._log_cf(f"⚠️ {error}", host)
+                elif self._html_fallback_drops_javdb_cookie(
+                    host=host,
+                    headers=headers,
+                    cookies=cookies,
+                ):
+                    error = (
+                        f"mirror: {mirror_error}; javdb 携带用户 Cookie，"
+                        "/html 回退不支持传 Cookie，已跳过以免发出无 Cookie 请求"
+                    )
+                    can_retry = False
+                    self._log_cf("⚠️ javdb 携带用户 Cookie，/html 回退不能传 Cookie，跳过", host)
                 elif str(method).upper() == "GET":
                     if html_bypass_cache:
                         self._log_cf(f"↩️ mirror 失败（强刷已启用），回退 /html: {mirror_error}", host)
