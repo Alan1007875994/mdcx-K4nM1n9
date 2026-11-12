@@ -5,10 +5,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote_plus, urljoin
 
 from mdcx.config.enums import Website
+from mdcx.config.models import CONFIGURABLE_SCRAPING_TYPES, SCRAPING_TYPE_SITE_FIELDS, Config
+from mdcx.web_async import CF_MIRROR_TIMEOUT, is_cf_challenge_response
 
 if TYPE_CHECKING:
     from mdcx.web_async import AsyncWebClient
@@ -129,21 +132,25 @@ def _check_timeout(spec: NetworkCheckSpec) -> float:
     return timeout
 
 
-def _is_cloudflare_challenge(text: str) -> bool:
-    lowered = text.lower()
-    challenge_markers = (
-        "challenge",
-        "ray id",
-        "ray-id",
-        "cf-browser-verification",
-        "just a moment",
-        "cf-chl",
-        "cdn-cgi/challenge-platform",
-        "attention required",
-        "enable javascript and cookies",
-        "checking your browser before accessing",
-    )
-    return "cloudflare" in lowered and any(marker in lowered for marker in challenge_markers)
+def _mirror_bypass_timeout(client: Any = None) -> float:
+    return float(getattr(client, "_cf_mirror_timeout", CF_MIRROR_TIMEOUT))
+
+
+def _is_cloudflare_challenge(
+    response_or_text: Any,
+    *,
+    status_code: int | None = None,
+    headers: dict[str, Any] | None = None,
+) -> bool:
+    if isinstance(response_or_text, str):
+        probe = SimpleNamespace(
+            status_code=status_code,
+            headers=headers or {},
+            content=response_or_text.encode("utf-8", errors="ignore"),
+            text=response_or_text,
+        )
+        return is_cf_challenge_response(probe)
+    return is_cf_challenge_response(response_or_text)
 
 
 def _is_proxy_error(error: str) -> bool:
@@ -173,8 +180,15 @@ def _clean_error(error: str) -> str:
     return error
 
 
-def _classify_http_result(spec: NetworkCheckSpec, status_code: int, text: str) -> tuple[NetworkCheckStatus, str]:
-    if _is_cloudflare_challenge(text):
+def _classify_http_result(
+    spec: NetworkCheckSpec,
+    status_code: int,
+    text: str,
+    *,
+    response: Any = None,
+) -> tuple[NetworkCheckStatus, str]:
+    challenge_target = response if response is not None else text
+    if _is_cloudflare_challenge(challenge_target, status_code=status_code):
         return NetworkCheckStatus.WARNING, "被 Cloudflare 挑战页拦截"
 
     if spec.site == Website.JAVDB:
@@ -254,9 +268,8 @@ async def _try_bypass_for_check(
         cookies=spec.cookies or None,
         data=None,
         json_data=None,
-        # CF Bypass 往往需要启动浏览器、刷新 Cookie 或等待挑战页完成, 使用 AsyncWebClient 内置的
-        # _cf_bypass_timeout, 不用普通诊断请求的短超时覆盖。
-        timeout=None,
+        # 检测时 mirror 等待时间与实际刮削一致（复用同一取值），不用普通诊断请求的短超时覆盖。
+        timeout=_mirror_bypass_timeout(client),
         allow_redirects=True,
         use_proxy=spec.use_proxy,
     )
@@ -307,16 +320,52 @@ def format_summary(results: list[NetworkCheckResult], elapsed: float, cancelled:
     return lines
 
 
+def _enabled_scraping_sites(config: Any = None) -> set[Website] | None:
+    config = _manager().config if config is None else config
+    get_type_sites = getattr(config, "get_type_sites", None)
+    if callable(get_type_sites):
+        enabled: set[Website] = set()
+        for scraping_type in CONFIGURABLE_SCRAPING_TYPES:
+            enabled.update(get_type_sites(scraping_type))
+        return enabled
+    if any(hasattr(config, field_name) for field_name in SCRAPING_TYPE_SITE_FIELDS.values()):
+        enabled = set()
+        for field_name in SCRAPING_TYPE_SITE_FIELDS.values():
+            enabled.update(Config.parse_sites(getattr(config, field_name, []) or []))
+        return enabled
+    return None
+
+
+def _count_disabled_scraping_sites() -> int:
+    from mdcx.crawlers import get_crawler, get_registered_crawler_sites
+
+    enabled_sites = _enabled_scraping_sites()
+    if enabled_sites is None:
+        return 0
+    disabled_count = 0
+    for site in get_registered_crawler_sites(include_hidden=False):
+        if site in (Website.THEPORNDB, Website.JAVDBAPI):
+            continue
+        if get_crawler(site) is None:
+            continue
+        if site not in enabled_sites:
+            disabled_count += 1
+    return disabled_count
+
+
 async def _build_site_specs() -> list[NetworkCheckSpec]:
     from mdcx.crawlers import get_crawler, get_registered_crawler_sites
 
     manager = _manager()
+    enabled_sites = _enabled_scraping_sites(manager.config)
     specs: list[NetworkCheckSpec] = []
     for site in get_registered_crawler_sites(include_hidden=False):
         if site == Website.THEPORNDB:
             continue
         crawler_cls = get_crawler(site)
         if crawler_cls is None:
+            continue
+        if site != Website.JAVDBAPI and enabled_sites is not None and site not in enabled_sites:
             continue
 
         default_url = DEFAULT_SITE_URLS.get(site)
@@ -523,7 +572,7 @@ async def run_network_check_item(
                 final_url=str(getattr(response, "url", "") or ""),
             )
 
-        if _is_cloudflare_challenge(text) and spec.enable_cf_bypass and _manager().config.cf_bypass_url.strip():
+        if _is_cloudflare_challenge(response) and spec.enable_cf_bypass and _manager().config.cf_bypass_url.strip():
             bypass_response, bypass_error = await _try_bypass_for_check(request_client, spec)
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             if bypass_response is None:
@@ -550,13 +599,13 @@ async def run_network_check_item(
                     elapsed_ms=elapsed_ms,
                     final_url=str(getattr(response, "url", "") or ""),
                 )
-            if not _is_cloudflare_challenge(text):
+            if not _is_cloudflare_challenge(response):
                 bypass_mode = ""
                 try:
                     bypass_mode = response.headers.get("x-mdcx-bypass-mode", "")
                 except Exception:
                     bypass_mode = ""
-                status, message = _classify_http_result(spec, int(response.status_code), text)
+                status, message = _classify_http_result(spec, int(response.status_code), text, response=response)
                 if status == NetworkCheckStatus.OK:
                     mode_text = f"（{bypass_mode}）" if bypass_mode else ""
                     message = f"连接正常，已通过 CF Bypass{mode_text}"
@@ -569,13 +618,20 @@ async def run_network_check_item(
                     final_url=str(getattr(response, "url", "") or ""),
                 )
 
-        status, message = _classify_http_result(spec, int(response.status_code), text)
+        status, message = _classify_http_result(spec, int(response.status_code), text, response=response)
+        bypass_mode = ""
+        try:
+            bypass_mode = response.headers.get("x-mdcx-bypass-mode", "")
+        except Exception:
+            bypass_mode = ""
         if spec.validator == "theporndb_token":
             status, message = _classify_theporndb_token(int(response.status_code), text)
         elif spec.validator == "javdbapi":
             status, message = _classify_javdbapi(int(response.status_code), text)
         elif spec.name == "CF Bypass" and status == NetworkCheckStatus.OK:
             message = "Cookie 检测通过"
+        elif bypass_mode and status == NetworkCheckStatus.OK:
+            message = f"连接正常，已通过 CF Bypass（{bypass_mode}）"
 
         return NetworkCheckResult(
             spec=spec,
@@ -634,6 +690,7 @@ async def run_network_check(
             progress(line)
 
     specs = await build_network_check_specs()
+    disabled_scraping_sites = _count_disabled_scraping_sites()
     results: list[NetworkCheckResult] = []
     grouped_specs = {group: [spec for spec in specs if spec.group == group] for group in GROUP_ORDER}
     semaphore = asyncio.Semaphore(max(int(concurrency), 1))
@@ -645,7 +702,8 @@ async def run_network_check(
     start_time = time.perf_counter()
     for group in GROUP_ORDER:
         group_specs = grouped_specs.get(group, [])
-        if not group_specs or group == "基础环境":
+        has_skipped_note = group == "刮削站点" and disabled_scraping_sites > 0
+        if (not group_specs and not has_skipped_note) or group == "基础环境":
             continue
         progress(group)
         tasks = [asyncio.create_task(run_one(spec)) for spec in group_specs]
@@ -662,6 +720,8 @@ async def run_network_check(
             result = await task
             results.append(result)
             progress(format_result_line(result))
+        if has_skipped_note:
+            progress(f"  ℹ️ 未启用、已跳过：{disabled_scraping_sites} 个")
 
     elapsed = time.perf_counter() - start_time
     for line in format_summary(results, elapsed, cancelled=bool(cancel_event and cancel_event.is_set())):

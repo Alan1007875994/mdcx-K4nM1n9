@@ -431,6 +431,52 @@ class HostPoolManager:
                 await pool.close()
 
 
+CF_MIRROR_TIMEOUT = 45.0
+
+
+def is_cf_challenge_response(response: Any) -> bool:
+    if response is None:
+        return False
+    status = getattr(response, "status_code", None)
+    raw_headers = getattr(response, "headers", None) or {}
+    headers = {str(k): v for k, v in raw_headers.items()}
+    server = AsyncWebClient._extract_header_case_insensitive(headers, "server").lower()
+    cf_ray = AsyncWebClient._extract_header_case_insensitive(headers, "cf-ray")
+
+    content_type = AsyncWebClient._extract_header_case_insensitive(headers, "content-type").lower()
+    body_text = ""
+    if "text/html" in content_type or not content_type:
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray)):
+            try:
+                body_text = bytes(content[:8192]).decode("utf-8", errors="ignore").lower()
+            except Exception:
+                body_text = ""
+        else:
+            try:
+                body_text = str(getattr(response, "text", "") or "")[:8192].lower()
+            except Exception:
+                body_text = ""
+
+    challenge_markers = (
+        "just a moment",
+        "cf-chl",
+        "cdn-cgi/challenge-platform",
+        "attention required",
+        "enable javascript and cookies",
+        "checking your browser before accessing",
+    )
+    has_marker = any(marker in body_text for marker in challenge_markers)
+
+    # 规则1: 明确 header + 挑战文案
+    if status in (403, 429, 503) and ("cloudflare" in server or bool(cf_ray)) and has_marker:
+        return True
+    # 规则2: 挑战文案足够明确时，允许无 header 命中
+    if has_marker and ("cf-chl" in body_text or "cdn-cgi/challenge-platform" in body_text):
+        return True
+    return False
+
+
 class AsyncWebClient:
     def __init__(
         self,
@@ -495,6 +541,7 @@ class AsyncWebClient:
         self._cf_site_min_intervals.update(self._site_request_intervals)
         self._site_last_request_at: dict[str, float] = {}
         self._cf_bypass_timeout = float(cf_bypass_timeout)
+        self._cf_mirror_timeout = CF_MIRROR_TIMEOUT
         self._cf_bypass_retries = 2
         self._cf_mirror_max_redirects = 8
         self._cf_request_bypass_rounds = 1
@@ -910,7 +957,8 @@ class AsyncWebClient:
             base.update(bypass_cookies)
         return base or None
 
-    def _extract_header_case_insensitive(self, headers: dict[str, Any], key: str) -> str:
+    @staticmethod
+    def _extract_header_case_insensitive(headers: dict[str, Any], key: str) -> str:
         key_lower = key.lower()
         for k, v in headers.items():
             if str(k).lower() == key_lower:
@@ -1220,36 +1268,7 @@ class AsyncWebClient:
         self._log(f"🛡️ [CF] {host_prefix}{message}")
 
     def _is_cf_challenge_response(self, response: Response) -> bool:
-        status = response.status_code
-        headers = {str(k): v for k, v in response.headers.items()}
-        server = self._extract_header_case_insensitive(headers, "server").lower()
-        cf_ray = self._extract_header_case_insensitive(headers, "cf-ray")
-
-        content_type = self._extract_header_case_insensitive(headers, "content-type").lower()
-        body_text = ""
-        if "text/html" in content_type or not content_type:
-            try:
-                body_text = response.content[:8192].decode("utf-8", errors="ignore").lower()
-            except Exception:
-                body_text = ""
-
-        challenge_markers = (
-            "just a moment",
-            "cf-chl",
-            "cdn-cgi/challenge-platform",
-            "attention required",
-            "enable javascript and cookies",
-            "checking your browser before accessing",
-        )
-        has_marker = any(marker in body_text for marker in challenge_markers)
-
-        # 规则1: 明确 header + 挑战文案
-        if status in (403, 429, 503) and ("cloudflare" in server or bool(cf_ray)) and has_marker:
-            return True
-        # 规则2: 挑战文案足够明确时，允许无 header 命中
-        if has_marker and ("cf-chl" in body_text or "cdn-cgi/challenge-platform" in body_text):
-            return True
-        return False
+        return is_cf_challenge_response(response)
 
     def _is_cf_1015_response(self, response: Response | None) -> bool:
         if response is None:
@@ -1473,7 +1492,7 @@ class AsyncWebClient:
                     data=current_data,
                     json=current_json_data,
                     # Preserve the pre-existing mirror timeout; only /html changes.
-                    timeout=timeout or 45.0,
+                    timeout=timeout or self._cf_mirror_timeout,
                     stream=False,
                     allow_redirects=False,
                 )
@@ -1534,7 +1553,7 @@ class AsyncWebClient:
                             headers=mirror_headers,
                             data=current_data,
                             json=current_json_data,
-                            timeout=timeout or 45.0,
+                            timeout=timeout or self._cf_mirror_timeout,
                             stream=False,
                             allow_redirects=False,
                         )
@@ -2061,7 +2080,7 @@ class AsyncWebClient:
                                 cookies=req_cookies,
                                 data=data,
                                 json_data=json_data,
-                                timeout=timeout,
+                                timeout=self._cf_mirror_timeout,
                                 allow_redirects=allow_redirects,
                                 use_proxy=bool((self.cf_bypass_proxy or "").strip()),
                             )

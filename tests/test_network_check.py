@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from mdcx.config.enums import Website
+from mdcx.config.models import Config
 from mdcx.core.network_check import (
     NetworkCheckSpec,
     NetworkCheckStatus,
@@ -13,6 +14,7 @@ from mdcx.core.network_check import (
     run_network_check,
     run_network_check_item,
 )
+from mdcx.web_async import CF_MIRROR_TIMEOUT, AsyncWebClient, is_cf_challenge_response
 
 
 class FakeResponse:
@@ -363,7 +365,7 @@ async def test_run_network_check_item_actively_uses_cf_bypass_on_challenge(monke
     assert result.message == "连接正常，已通过 CF Bypass（mirror）"
     assert client.bypass_calls[0]["target_url"] == "https://cf.example"
     assert client.bypass_calls[0]["headers"] == {"cookie": "a=b"}
-    assert client.bypass_calls[0]["timeout"] is None
+    assert client.bypass_calls[0]["timeout"] == CF_MIRROR_TIMEOUT
 
 
 @pytest.mark.anyio
@@ -438,3 +440,205 @@ async def test_site_check_keeps_diagnostic_timeout():
     await run_network_check_item(spec, client=client)
 
     assert client.calls[0]["timeout"] == 5.0
+
+
+@pytest.mark.anyio
+async def test_network_check_only_checks_enabled_scraping_sites_and_reports_skipped_count(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    site_urls = {
+        Website.MISSAV: "https://missav.example",
+        Website.MMTV: "https://7mmtv.example",
+        Website.CABLEAV: "https://cableav.example",
+        Website.FC2CLUB: "https://fc2club.example",
+        Website.FC2PPVDB: "https://fc2ppvdb.example",
+        Website.JAVDBAPI: "https://api.javdb.example/v1",
+        Website.THEPORNDB: "https://theporndb.example",
+    }
+
+    def get_crawler(site: Website):
+        url = site_urls.get(site)
+        if url is None:
+            return None
+        return SimpleNamespace(base_url_=lambda u=url: u)
+
+    fake_crawlers = SimpleNamespace(
+        get_registered_crawler_sites=lambda include_hidden=False: list(site_urls.keys()),
+        get_crawler=get_crawler,
+    )
+    monkeypatch.setitem(sys.modules, "mdcx.crawlers", fake_crawlers)
+
+    config = Config(
+        website_youma=[Website.MISSAV],
+        website_wuma=[Website.MMTV],
+        website_suren=[],
+        website_fc2=[],
+        website_oumei=[Website.THEPORNDB],
+        website_guochan=[],
+        cf_bypass_url="http://127.0.0.1:8000",
+        theporndb_api_token="token-123",
+    )
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: SimpleNamespace(config=config, computed=None))
+
+    specs = await build_network_check_specs()
+    scraping_sites = [spec.site for spec in specs if spec.group == "刮削站点"]
+    assert scraping_sites == [Website.MISSAV, Website.MMTV]
+    assert {spec.name for spec in specs if spec.group == "基础连通性"} == {"GitHub Raw", "通用 HTTPS"}
+    assert {spec.name for spec in specs if spec.group == "账号/API"} == {"ThePornDB Token", "javdbapi"}
+    assert {spec.name for spec in specs if spec.group == "辅助服务"} == {"CF Bypass"}
+
+    class RecordingClient(FakeClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if "api.theporndb.net" in url:
+                return FakeResponse(status_code=200, text='{"data": {}}', url=url), ""
+            if "api.javdb.example" in url:
+                return FakeResponse(status_code=200, text='{"universal_id": "SSNI-200"}', url=url), ""
+            return FakeResponse(status_code=200, text="<html>ok</html>", url=url), ""
+
+    client = RecordingClient()
+    lines: list[str] = []
+    results = await run_network_check(progress=lines.append, client=client, concurrency=2, emit_header=False)
+
+    requested_urls = [call["url"] for call in client.calls]
+    assert not any("cableav.example" in url for url in requested_urls)
+    assert not any("fc2club.example" in url for url in requested_urls)
+    assert not any("fc2ppvdb.example" in url for url in requested_urls)
+    assert {r.spec.site for r in results if r.spec.group == "刮削站点"} == {Website.MISSAV, Website.MMTV}
+    assert "  ℹ️ 未启用、已跳过：3 个" in lines
+
+
+@pytest.mark.anyio
+async def test_network_check_mirror_bypass_uses_scraping_mirror_timeout(monkeypatch: pytest.MonkeyPatch):
+    class RawResponse:
+        def __init__(self, status_code: int, content: bytes, url: str, headers: dict[str, str] | None = None):
+            self.status_code = status_code
+            self.content = content
+            self.text = content.decode("utf-8", errors="ignore")
+            self.url = url
+            self.headers = dict(headers or {})
+            self.encoding = "utf-8"
+
+    challenge_html = (
+        b"<html><head><title>Just a moment...</title></head>"
+        b"<body><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script></body></html>"
+    )
+    normal_html = b"<html><body>normal page</body></html>"
+
+    client = AsyncWebClient(timeout=15, cf_bypass_url="http://127.0.0.1:8000", retry=1)
+    curl_calls: list[dict] = []
+
+    async def fake_curl_request(**kwargs):
+        curl_calls.append(kwargs)
+        url = kwargs["url"]
+        if url.startswith("http://127.0.0.1:8000/"):
+            return RawResponse(200, normal_html, url, headers={"content-type": "text/html"})
+        return RawResponse(
+            403,
+            challenge_html,
+            url,
+            headers={"server": "cloudflare", "cf-ray": "89abcdef-NRT", "content-type": "text/html"},
+        )
+
+    monkeypatch.setattr(client, "_curl_request", fake_curl_request)
+    config = FakeConfig()
+    config.cf_bypass_url = "http://127.0.0.1:8000"
+    config.timeout = 15
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: SimpleNamespace(config=config, computed=None))
+
+    try:
+        scrape_resp, scrape_err = await client.request("GET", "https://scrape-cf.example/video")
+        assert scrape_err == ""
+        assert scrape_resp is not None
+        scrape_mirror_timeout = next(c["timeout"] for c in curl_calls if c["url"].startswith("http://127.0.0.1:8000/"))
+
+        curl_calls.clear()
+        spec = NetworkCheckSpec(
+            name="missav",
+            group="刮削站点",
+            site=Website.MISSAV,
+            url="https://check-cf.example/",
+            enable_cf_bypass=True,
+        )
+        result = await run_network_check_item(spec, client=client)
+
+        direct_call = next(c for c in curl_calls if not c["url"].startswith("http://127.0.0.1:8000/"))
+        mirror_call = next(c for c in curl_calls if c["url"].startswith("http://127.0.0.1:8000/"))
+        assert direct_call["timeout"] == 5.0
+        assert mirror_call["timeout"] == scrape_mirror_timeout == CF_MIRROR_TIMEOUT
+        assert result.status == NetworkCheckStatus.OK
+        assert result.message == "连接正常，已通过 CF Bypass（mirror）"
+    finally:
+        await client.close()
+
+
+@pytest.mark.anyio
+async def test_network_check_200_normal_page_with_residual_cf_markers_not_flagged_and_real_challenge_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = FakeConfig()
+    config.cf_bypass_url = "http://127.0.0.1:8000"
+    monkeypatch.setattr("mdcx.core.network_check._manager", lambda: SimpleNamespace(config=config, computed=None))
+
+    residual_200_html = (
+        "<html><head><script src='https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js'></script></head>"
+        "<body><h1>7mmtv challenge video</h1><footer>Cloudflare Ray ID: 1234567890abcdef</footer></body></html>"
+    )
+
+    class NormalWithResidualClient(FakeBypassClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            resp = FakeResponse(status_code=200, text=residual_200_html, url=url)
+            resp.headers = {"server": "cloudflare", "cf-ray": "1234567890abcdef-HKG", "content-type": "text/html"}
+            return resp, ""
+
+    normal_client = NormalWithResidualClient()
+    spec = NetworkCheckSpec(
+        name="7mmtv",
+        group="刮削站点",
+        site=Website.MMTV,
+        url="https://7mmtv.example/",
+        enable_cf_bypass=True,
+    )
+    normal_result = await run_network_check_item(spec, client=normal_client)
+    assert is_cf_challenge_response(FakeResponse(status_code=200, text=residual_200_html)) is False
+    assert normal_result.status == NetworkCheckStatus.OK
+    assert normal_result.message == "连接正常"
+    assert normal_client.bypass_calls == []
+
+    # Real challenge page (403 with cloudflare header + challenge marker, or challenge-platform marker)
+    no_bypass_config = FakeConfig()
+    no_bypass_config.cf_bypass_url = ""
+    monkeypatch.setattr(
+        "mdcx.core.network_check._manager", lambda: SimpleNamespace(config=no_bypass_config, computed=None)
+    )
+
+    class RealChallengeClient(FakeClient):
+        def __init__(self, response: FakeResponse):
+            super().__init__()
+            self._response = response
+
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            return self._response, ""
+
+    challenge_403 = FakeResponse(
+        status_code=403,
+        text="<html><head><title>Just a moment...</title></head><body>Checking your browser before accessing</body></html>",
+        url="https://cf.example/",
+    )
+    challenge_403.headers = {"server": "cloudflare", "cf-ray": "9999-NRT", "content-type": "text/html"}
+    assert is_cf_challenge_response(challenge_403) is True
+    res_403 = await run_network_check_item(spec, client=RealChallengeClient(challenge_403))
+    assert res_403.status == NetworkCheckStatus.WARNING
+    assert res_403.message == "被 Cloudflare 挑战页拦截"
+
+    challenge_platform = FakeResponse(
+        status_code=503,
+        text="<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1'></script></html>",
+        url="https://cf.example/",
+    )
+    assert is_cf_challenge_response(challenge_platform) is True
+    res_platform = await run_network_check_item(spec, client=RealChallengeClient(challenge_platform))
+    assert res_platform.status == NetworkCheckStatus.WARNING
+    assert res_platform.message == "被 Cloudflare 挑战页拦截"
